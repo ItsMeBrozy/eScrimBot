@@ -1,0 +1,24 @@
+{
+  "name": "escrims-bot",
+  "version": "1.0.0",
+  "description": "24/7 Discord Bot for Hugging Face with Free Persistence",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.1",
+    "express": "^4.18.2",
+    "mongoose": "^8.2.0",
+    "undici": "^5.28.4"
+  },
+  "engines": {
+    "node": "20.x"
+  },
+  "devDependencies": {
+    "eslint": "^10.4.1",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.0.6"
+  }
+}
