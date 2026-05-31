@@ -148,6 +148,7 @@ async function createMatch(guild, playerDocs, settings, forcedMatchId = null) {
                 {
                     id: matchRole.id,
                     allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
+                    deny: [PermissionFlagsBits.SendMessages],
                 }
             ],
         }));
@@ -482,13 +483,6 @@ async function startPicking(client, match, c1, c2) {
         const lounge = await retryPromise(() => guild.channels.fetch(match.loungeChannelId)).catch(() => null);
         if (!lounge) return;
 
-        // Re-enable SendMessages for the match role in the lounge
-        if (match.roleId) {
-            await lounge.permissionOverwrites.edit(match.roleId, {
-                SendMessages: true
-            }).catch(err => console.error(`>>> [PERMISSION] Failed to re-enable SendMessages in lounge:`, err.message));
-        }
-
         // Filter captains out of the remaining pool — captains pick, they don't get picked
         const remaining = match.remainingPlayers
             ? match.remainingPlayers.split(',').filter(id => id !== c1 && id !== c2)
@@ -663,6 +657,14 @@ async function finalizeTeams(client, match) {
         if (lounge && match.pickerMsgId) {
             const oldMsg = await retryPromise(() => lounge.messages.fetch(match.pickerMsgId)).catch(() => null);
             if (oldMsg) await retryPromise(() => oldMsg.delete()).catch(() => {});
+        }
+
+        // Unlock chat now that teams are set and players are in their VCs
+        if (lounge && match.roleId) {
+            await lounge.permissionOverwrites.edit(match.roleId, {
+                SendMessages: true
+            }).catch(err => console.error('>>> [PERMISSION] Failed to unlock lounge chat:', err.message));
+            await lounge.send('Chat is now unlocked! Good luck both teams!').catch(() => {});
         }
     } catch (err) {
         console.error('>>> [ERROR] finalizeTeams failed:', err);

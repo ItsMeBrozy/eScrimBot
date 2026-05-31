@@ -88,6 +88,7 @@ const ApplicationSchema = new mongoose.Schema({
     guildId: String, 
     appType: String, 
     answers: [String], 
+    currentQuestionIndex: { type: Number, default: 0 },
     status: { type: String, default: "pending" } 
 });
 

@@ -162,6 +162,8 @@ const slashCommands = [
             { name: 'Hoster', value: 'Hoster' }
         ]}
     ] },
+    { name: 'dm', description: 'Send a DM to a user as the bot', options: [{ name: 'user', description: 'The user to DM', type: 6, required: true }, { name: 'message', description: 'The message to send', type: 3, required: true }] },
+    { name: 'apply', description: 'Apply for a Staff, Referee, or Hoster position', options: [{ name: 'position', description: 'The position to apply for', type: 3, required: true, choices: [{ name: 'Staff', value: 'Staff' }, { name: 'Referee', value: 'Referee' }, { name: 'Hoster', value: 'Hoster' }] }] },
     { name: 'setup', description: 'Shows bot setup instructions' },
     { name: 'verify', description: 'Links your Discord account to your Roblox account using Bloxlink' },
     { name: 'queue-enable', description: 'Starts queue loop in the current channel', options: [{ name: 'interval', description: 'Minutes between queues', type: 4, required: true }] },
@@ -302,12 +304,11 @@ async function start() {
 
     // === STEP 1: Create Discord Client ===
     const { Agent } = require('undici');
-    const { Agent } = require('undici');
     const clientOptions = {
         intents: [
             GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
             GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates,
-            GatewayIntentBits.GuildMessageReactions
+            GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.DirectMessages
         ],
         partials: [Partials.Message, Partials.Channel, Partials.Reaction]
     };
@@ -660,43 +661,55 @@ async function start() {
                 return message.reply({ embeds: [embed] });
             }
         } else {
-            // DM message
-            const activeApp = activeApplications.get(message.author.id);
+            // DM message — handle application answers (works for plain messages AND replies)
+            if (message.author.bot) return;
+
+            // Check in-memory first (fast), then fall back to MongoDB (survives restarts)
+            let activeApp = activeApplications.get(message.author.id);
+            if (!activeApp) {
+                const dbApp = await Application.findOne({ userId: message.author.id, status: 'in_progress' }).catch(() => null);
+                if (dbApp) {
+                    activeApp = { appType: dbApp.appType, currentQuestionIndex: dbApp.currentQuestionIndex, answers: dbApp.answers || [], guildId: dbApp.guildId };
+                    activeApplications.set(message.author.id, activeApp);
+                }
+            }
+
             if (activeApp) {
-                const { appType, currentQuestionIndex, answers, guildId } = activeApp;
-                const questions = APP_DATA[appType].questions;
+                const { appType, currentQuestionIndex, guildId } = activeApp;
+                const answers = [...(activeApp.answers || [])];
+                const questions = APP_DATA[appType] ? APP_DATA[appType].questions : null;
+                if (!questions) return;
 
                 if (currentQuestionIndex < questions.length) {
-                    answers.push(message.content);
+                    // Accept the answer — strip any reply reference prefix Discord adds
+                    const answerText = message.content.trim();
+                    answers.push(answerText);
                     const nextIndex = currentQuestionIndex + 1;
 
                     if (nextIndex < questions.length) {
-                        activeApplications.set(message.author.id, {
-                            appType,
-                            currentQuestionIndex: nextIndex,
-                            answers,
-                            guildId
-                        });
-                        await message.reply(`**Question ${nextIndex + 1} of 4:**\n${questions[nextIndex]}`).catch(() => {});
+                        // More questions — advance state in both memory and DB
+                        const updated = { appType, currentQuestionIndex: nextIndex, answers, guildId };
+                        activeApplications.set(message.author.id, updated);
+                        await Application.findOneAndUpdate(
+                            { userId: message.author.id, status: 'in_progress' },
+                            { currentQuestionIndex: nextIndex, answers }
+                        ).catch(() => {});
+                        await message.channel.send(`**Question ${nextIndex + 1} of ${questions.length}:**
+${questions[nextIndex]}`).catch(() => {});
                     } else {
-                        // Finished all questions
+                        // All questions answered — finalize
                         activeApplications.delete(message.author.id);
-                        
-                        // Save to DB
-                        const app = await Application.create({
-                            userId: message.author.id,
-                            guildId,
-                            appType,
-                            answers,
-                            status: 'pending'
-                        });
+                        await Application.findOneAndUpdate(
+                            { userId: message.author.id, status: 'in_progress' },
+                            { answers, status: 'pending', currentQuestionIndex: nextIndex }
+                        ).catch(() => {});
 
                         // Send to application channel
                         const appChannel = client.channels.cache.get(APP_CHANNEL_ID) || await client.channels.fetch(APP_CHANNEL_ID).catch(() => null);
                         if (appChannel) {
                             const embed = new EmbedBuilder()
                                 .setTitle(`🆕 New ${appType} Application`)
-                                .setColor('#5865F2')
+                                .setColor('#FFFFFF')
                                 .setThumbnail(message.author.displayAvatarURL())
                                 .addFields(
                                     { name: '👤 Applicant', value: `<@${message.author.id}> (${message.author.tag})`, inline: true },
@@ -713,10 +726,10 @@ async function start() {
                                 new ButtonBuilder().setCustomId(`app_review_decline_${message.author.id}_${appType}`).setLabel('Decline').setStyle(ButtonStyle.Danger)
                             );
 
-                            await appChannel.send({ embeds: [embed], components: [row] });
+                            await appChannel.send({ content: '<@1474461121531347165> — New application submitted!', embeds: [embed], components: [row] });
                         }
 
-                        await message.reply('✅ Thank you! Your application has been submitted and is awaiting review.').catch(() => {});
+                        await message.channel.send('✅ Thank you! Your application has been submitted and is awaiting review.').catch(() => {});
                     }
                 }
             }
@@ -874,7 +887,8 @@ async function start() {
 
     client.on('interactionCreate', async (interaction) => {
         try {
-            if (!interaction.guildId || !ALLOWED_GUILDS.includes(interaction.guildId)) {
+            const isDmAppButton = !interaction.guildId && interaction.isButton && interaction.isButton() && interaction.customId && (interaction.customId.startsWith('app_start_') || interaction.customId.startsWith('app_decline_'));
+            if (!isDmAppButton && (!interaction.guildId || !ALLOWED_GUILDS.includes(interaction.guildId))) {
                 if (interaction.isRepliable()) {
                     await interaction.reply({ content: '❌ This bot is not authorized to run on this server.', ephemeral: true }).catch(() => {});
                 }
@@ -889,23 +903,29 @@ async function start() {
 
             // --- APPLICATION HANDLERS ---
             if (interaction.customId && interaction.customId.startsWith('app_start_')) {
-                // customId: app_start_<appType>_<userId>
-                const [, , appType, targetUserId] = interaction.customId.split('_');
+                // customId: app_start_<appType>_<userId>_<guildId>
+                const parts = interaction.customId.split('_');
+                const appType = parts[2];
+                const targetUserId = parts[3];
+                const guildId = parts[4] || null;
                 const targetUser = await client.users.fetch(targetUserId).catch(() => null);
 
                 if (!targetUser) return interaction.reply({ content: '❌ User not found.', ephemeral: true });
                 if (interaction.user.id !== targetUserId) return interaction.reply({ content: '❌ You can only accept your own application.', ephemeral: true });
 
-                activeApplications.set(targetUserId, { appType, currentQuestionIndex: 0, answers: [] });
-
                 try {
                     const questions = APP_DATA[appType].questions;
-                    await targetUser.send({
-                        content: `### 📝 ${appType} Application\n**Question 1 of 4:**\n${questions[0]}`,
-                        component: null // wait, buttons are for Accept/Decline
-                    });
-                    // Wait, I should use buttons for the first question too? No, user just needs to type.
-                    // But let's use a more interactive way if possible. For now, just text.
+
+                    // Persist to MongoDB so state survives restarts
+                    await Application.findOneAndDelete({ userId: targetUserId, status: 'in_progress' }).catch(() => {});
+                    await Application.create({ userId: targetUserId, guildId, appType, answers: [], currentQuestionIndex: 0, status: 'in_progress' });
+
+                    // Also keep in-memory for fast lookups
+                    activeApplications.set(targetUserId, { appType, currentQuestionIndex: 0, answers: [], guildId });
+
+                    await targetUser.send(`### 📝 ${appType} Application
+**Question 1 of ${questions.length}:**
+${questions[0]}`);
                     await interaction.update({ content: '✅ Application started in your DMs!', components: [] }).catch(() => {});
                 } catch (err) {
                     console.error('>>> [ERROR] Failed to start application in DM:', err.message);
@@ -929,6 +949,10 @@ async function start() {
                 // customId: app_review_<action>_<userId>_<appType>
                 const [, , action, userId, appType] = interaction.customId.split('_');
                 const guild = interaction.guild;
+                const reviewer = interaction.member;
+                if (interaction.user.id !== '1474461121531347165') {
+                    return interaction.reply({ content: '❌ You do not have permission to review applications.', ephemeral: true });
+                }
                 const member = await guild.members.fetch(userId).catch(() => null);
 
                 if (action === 'accept') {
@@ -943,7 +967,8 @@ async function start() {
                     app.status = 'accepted';
                     await app.save();
 
-                    await interaction.update({ content: `✅ Application for <@${userId}> (${appType}) has been **ACCEPTED**.`, components: [] }).catch(() => {});
+                    const acceptEmbed = EmbedBuilder.from(interaction.message.embeds[0]).setColor('#00FF00');
+                    await interaction.update({ content: `✅ Application for <@${userId}> (${appType}) has been **ACCEPTED**. Reviewed by <@${interaction.user.id}>.`, embeds: [acceptEmbed], components: [] }).catch(() => {});
                     if (member) await member.send(`🎉 Congratulations! Your **${appType}** application has been **ACCEPTED**!`).catch(() => {});
                 } else {
                     const app = await Application.findOne({ userId, guildId: guild.id, status: 'pending' });
@@ -952,7 +977,8 @@ async function start() {
                     app.status = 'declined';
                     await app.save();
 
-                    await interaction.update({ content: `❌ Application for <@${userId}> (${appType}) has been **DECLINED**.`, components: [] }).catch(() => {});
+                    const declineEmbed = EmbedBuilder.from(interaction.message.embeds[0]).setColor('#FF0000');
+                    await interaction.update({ content: `❌ Application for <@${userId}> (${appType}) has been **DECLINED**. Reviewed by <@${interaction.user.id}>.`, embeds: [declineEmbed], components: [] }).catch(() => {});
                     if (member) await member.send(`❌ Your **${appType}** application has been **DECLINED**.`).catch(() => {});
                 }
                 return;
@@ -1038,6 +1064,7 @@ async function start() {
 
             if (interaction.isChatInputCommand()) {
                 const { commandName, options, guild, user, member, channel } = interaction;
+                const isOwnerOrSpecialRole = user.id === '1479214179146535096' || member?.roles.cache.has('1503745954627584172');
                 console.log(`>>> [CMD] ${user.tag} (ID: ${user.id}) used /${commandName} in ${guild?.name || 'DM'} (#${channel?.name || 'unknown'})`);
 
                 // Permission check based on permissions.txt and special owner/role bypasses
@@ -1065,7 +1092,7 @@ async function start() {
                             .setTimestamp();
 
                         const row = new ActionRowBuilder().addComponents(
-                            new ButtonBuilder().setCustomId(`app_start_${appType}_${user.id}`).setLabel('Yes, I do!').setStyle(ButtonStyle.Success),
+                            new ButtonBuilder().setCustomId(`app_start_${appType}_${user.id}_${guild.id}`).setLabel('Yes, I do!').setStyle(ButtonStyle.Success),
                             new ButtonBuilder().setCustomId(`app_decline_${user.id}`).setLabel('No, thanks.').setStyle(ButtonStyle.Danger)
                         );
 
@@ -1075,13 +1102,48 @@ async function start() {
                         console.error('>>> [ERROR] Failed to send DM for app request:', err.message);
                         return interaction.reply({ content: `❌ Could not send DM to <@${user.id}>. Their DMs might be closed.`, ephemeral: true });
                     }
+                } else if (commandName === 'dm') {
+                    if (!isOwnerOrSpecialRole) return interaction.reply({ content: '❌ You do not have permission to use this command.', ephemeral: true });
+                    const target = options.getUser('user');
+                    const msg = options.getString('message');
+                    try {
+                        await target.send(msg);
+                        return interaction.reply({ content: `✅ DM sent to <@${target.id}>.`, ephemeral: true });
+                    } catch (err) {
+                        return interaction.reply({ content: `❌ Could not DM <@${target.id}>. Their DMs may be closed.`, ephemeral: true });
+                    }
+                } else if (commandName === 'apply') {
+                    // Public self-apply command
+                    const appType = options.getString('position');
+                    if (!APP_DATA[appType]) return interaction.reply({ content: '❌ Invalid position.', ephemeral: true });
+
+                    // Check if already has an in-progress application
+                    const existing = await Application.findOne({ userId: user.id, status: 'in_progress' }).catch(() => null);
+                    if (existing) return interaction.reply({ content: '❌ You already have an application in progress. Please check your DMs.', ephemeral: true });
+
+                    try {
+                        const questions = APP_DATA[appType].questions;
+                        // Persist to MongoDB
+                        await Application.create({ userId: user.id, guildId: guild.id, appType, answers: [], currentQuestionIndex: 0, status: 'in_progress' });
+                        // Keep in-memory too
+                        activeApplications.set(user.id, { appType, currentQuestionIndex: 0, answers: [], guildId: guild.id });
+                        // Send first question directly
+                        await interaction.user.send(`### 📝 ${appType} Application
+**Question 1 of ${questions.length}:**
+${questions[0]}`);
+                        return interaction.reply({ content: '✅ Application started! Check your DMs for the first question.', ephemeral: true });
+                    } catch (err) {
+                        console.error('>>> [ERROR] Failed to start self-application:', err.message);
+                        await Application.findOneAndDelete({ userId: user.id, status: 'in_progress' }).catch(() => {});
+                        activeApplications.delete(user.id);
+                        return interaction.reply({ content: '❌ Could not send you a DM. Please open your DMs and try again.', ephemeral: true });
+                    }
                 } else {
                     const requiredRoles = permissions[commandName] || [];
                     const everyCmdRoles = permissions["every_cmd"] || [];
                     
                     const hasRole = member?.roles.cache.some(role => requiredRoles.includes(role.id) || everyCmdRoles.includes(role.id));
                     const isAdmin = member?.permissions?.has(PermissionFlagsBits.Administrator);
-                    const isOwnerOrSpecialRole = user.id === '1479214179146535096' || member?.roles.cache.has('1503745954627584172');
                     
                     const hasPermission = hasRole || isOwnerOrSpecialRole || isAdmin;
                     
