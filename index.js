@@ -2340,11 +2340,11 @@ ${questions[0]}`);
 
             try {
                 if (!interaction.replied && !interaction.deferred) {
-                    await safeInteractionReply(interaction, { content: '❌ An internal error occurred while processing this command.', ephemeral: true }).catch(() => { });
+                    await safeInteractionReply(interaction, { content: '❌ An internal error occurred while processing this command.', flags: MessageFlags.Ephemeral }).catch(() => { });
                 } else if (interaction.deferred) {
                     await safeInteractionEditReply(interaction, { content: '❌ An error occurred while executing this command.' }).catch(() => { });
                 } else {
-                    await safeInteractionFollowUp(interaction, { content: '❌ An error occurred while executing this command.', ephemeral: true }).catch(() => { });
+                    await safeInteractionFollowUp(interaction, { content: '❌ An error occurred while executing this command.', flags: MessageFlags.Ephemeral }).catch(() => { });
                 }
             } catch (secondaryErr) {
                 console.error('>>> [CRITICAL] Failed to send error message to user:', secondaryErr.message);

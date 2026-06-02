@@ -1,6 +1,6 @@
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, PermissionFlagsBits, StringSelectMenuBuilder, MessageFlags } = require('discord.js');
 const { QueueConfig, ActiveQueuePlayer, GuildSettings, Match, PointHistory, BlacklistedUser } = require('./models');
-const { safeChannelSend, safeMessageEdit, safeInteractionDeferReply, safeInteractionReply, safeInteractionEditReply, safeInteractionFollowUp } = require('./safe-utils');
+const { safeChannelSend, safeMessageEdit, safeInteractionDeferReply, safeInteractionReply, safeInteractionEditReply, safeInteractionFollowUp, normalizeOptions } = require('./safe-utils');
 
 const queueIntervals = new Map();
 const methodTimeouts = new Map();
@@ -1085,7 +1085,7 @@ async function handleSubRequestInteraction(interaction, client) {
         if (typeof safeInteractionReply !== 'function') {
             console.error('>>> [SUB-INTERACTION-ERROR] safeInteractionReply not available as function:', typeof safeInteractionReply);
             if (interaction.isRepliable()) {
-                await interaction.reply({ content: '❌ Internal error: sub system not ready.', ephemeral: true }).catch(() => {});
+                await interaction.reply(normalizeOptions({ content: '❌ Internal error: sub system not ready.', ephemeral: true })).catch(() => {});
             }
             return true;
         }
@@ -1254,7 +1254,7 @@ async function handleSubRequestInteraction(interaction, client) {
                 if (interaction.deferred || interaction.replied) {
                     await interaction.editReply({ content: '❌ Error processing substitution request.' }).catch(() => {});
                 } else {
-                    await interaction.reply({ content: '❌ Error processing substitution request.', ephemeral: true }).catch(() => {});
+                    await interaction.reply(normalizeOptions({ content: '❌ Error processing substitution request.', ephemeral: true })).catch(() => {});
                 }
             } catch (replyErr) {
                 console.error('>>> [SUB-INTERACTION-ERROR] Fallback response failed:', replyErr.message);

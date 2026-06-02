@@ -1,4 +1,15 @@
 const DEFAULT_FETCH_TIMEOUT = 15000;
+const EPHEMERAL_FLAG = 1 << 6; // MessageFlags.Ephemeral = 64
+
+// Utility: Convert deprecated ephemeral: true to flags: MessageFlags.Ephemeral
+function normalizeOptions(options = {}) {
+    const normalized = { ...options };
+    if (normalized.ephemeral === true) {
+        normalized.flags = EPHEMERAL_FLAG;
+        delete normalized.ephemeral;
+    }
+    return normalized;
+}
 
 function isRepliableInteraction(interaction) {
     return interaction && typeof interaction.isRepliable === 'function' && interaction.isRepliable();
@@ -61,14 +72,15 @@ function createDiscordRestAdapter(proxyAgent) {
 
 async function safeReply(interaction, response) {
     if (!isRepliableInteraction(interaction)) return null;
+    const opts = normalizeOptions(response);
     try {
         if (interaction.replied || interaction.deferred || (typeof interaction.isAcknowledged === 'function' && interaction.isAcknowledged())) {
-            return await interaction.followUp(response).catch(err => {
+            return await interaction.followUp(opts).catch(err => {
                 console.error('>>> [ERROR] Safe followUp failed:', err.message);
                 return null;
             });
         }
-        return await interaction.reply(response).catch(err => {
+        return await interaction.reply(opts).catch(err => {
             console.error('>>> [ERROR] Safe reply failed:', err.message);
             return null;
         });
@@ -80,12 +92,13 @@ async function safeReply(interaction, response) {
 
 async function safeEditReply(interaction, response) {
     if (!isRepliableInteraction(interaction)) return null;
+    const opts = normalizeOptions(response);
     try {
         if (interaction.replied || interaction.deferred || (typeof interaction.isAcknowledged === 'function' && interaction.isAcknowledged())) {
-            return await interaction.editReply(response).catch(async (err) => {
+            return await interaction.editReply(opts).catch(async (err) => {
                 console.error('>>> [ERROR] Safe editReply failed:', err.message);
                 if (!interaction.replied && !interaction.deferred) {
-                    return interaction.reply(response).catch(err2 => {
+                    return interaction.reply(opts).catch(err2 => {
                         console.error('>>> [ERROR] Fallback reply after editReply failed:', err2.message);
                         return null;
                     });
@@ -93,7 +106,7 @@ async function safeEditReply(interaction, response) {
                 return null;
             });
         }
-        return await interaction.reply(response).catch(err => {
+        return await interaction.reply(opts).catch(err => {
             console.error('>>> [ERROR] Safe reply during editReply fallback failed:', err.message);
             return null;
         });
@@ -121,8 +134,9 @@ async function safeDeferReply(interaction, options = {}) {
 
 async function safeFollowUp(interaction, response) {
     if (!interaction || typeof interaction.followUp !== 'function') return null;
+    const opts = normalizeOptions(response);
     try {
-        return await interaction.followUp(response).catch(err => {
+        return await interaction.followUp(opts).catch(err => {
             console.error('>>> [ERROR] Safe followUp failed:', err.message);
             return null;
         });
@@ -257,10 +271,11 @@ async function ensureInteractionAcknowledged(interaction, options = {}) {
         if (isTimeout) {
             // Silently try a direct reply as fallback
             try {
-                await interaction.reply({ content: '⏳ Processing...', ...options, ephemeral: true });
+                console.log('>>> [DEFER FALLBACK] Defer timed out, sending direct reply instead');
+                await interaction.reply({ content: '⏳ Processing...', ...options });
                 return { acknowledged: true, deferred: false };
             } catch (replyErr) {
-                // Even reply failed, nothing we can do
+                console.error('>>> [ERROR] Fallback reply also failed:', replyErr.message);
                 return { acknowledged: false, deferred: false };
             }
         }
@@ -293,5 +308,6 @@ module.exports = {
     safeChannelSend,
     safeUserSend,
     safeMessageEdit,
-    ensureInteractionAcknowledged
+    ensureInteractionAcknowledged,
+    normalizeOptions
 };
