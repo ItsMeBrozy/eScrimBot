@@ -8,7 +8,7 @@ const { ProxyAgent } = require('undici');
 const mongoose = require('mongoose');
 const { Hub, TempChannel, LfmMessage, GuildSettings, UserPoints, QueueConfig, ActiveQueuePlayer, Match, PointHistory, Permission, VerifiedUser, BlacklistedUser, Application } = require('./models');
 const { getStatsEmbed, getSearchEmbed } = require('./stats');
-const { safeFetch, createDiscordRestAdapter, safeInteractionReply, safeInteractionEditReply, safeInteractionDeferReply, safeInteractionFollowUp, safeMessageReply, safeChannelSend, safeUserSend } = require('./safe-utils');
+const { safeFetch, createDiscordRestAdapter, safeInteractionReply, safeInteractionEditReply, safeInteractionDeferReply, safeInteractionFollowUp, safeMessageReply, safeChannelSend, safeUserSend, ensureInteractionAcknowledged } = require('./safe-utils');
 const fs = require('fs');
 require('dotenv').config();
 
@@ -22,8 +22,13 @@ async function safeDeferReply(interaction, options = {}) {
         await safeInteractionDeferReply(interaction, options);
         return true;
     } catch (err) {
-        console.error('>>> [ERROR] Defer failed:', err.message);
-        return false;
+        // Suppress timeout errors but still allow command to proceed with direct reply if deferred flag exists
+        const isTimeout = err.message?.includes('Connect Timeout') || err.message?.includes('ECONNREFUSED') || err.code === 'UND_ERR_CONNECT_TIMEOUT';
+        if (!isTimeout) {
+            console.error('>>> [ERROR] Defer failed:', err.message);
+        }
+        // Return true to allow command to continue - it will use direct reply instead of edit
+        return interaction.deferred || interaction.replied;
     }
 }
 
@@ -1531,8 +1536,9 @@ ${questions[0]}`);
                     return safeInteractionEditReply(interaction, result).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                 }
                 if (commandName === 'go') {
-                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
-                    if (!interaction.deferred && !interaction.replied) return;
+                    // Ensure response will be sent even if defer fails
+                    const { acknowledged, deferred } = await ensureInteractionAcknowledged(interaction, { flags: MessageFlags.Ephemeral });
+                    if (!acknowledged) return;
 
                     await QueueConfig.findOneAndUpdate(
                         { guildId: guild.id, channelId: channel.id },

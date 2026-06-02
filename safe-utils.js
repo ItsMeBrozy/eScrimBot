@@ -242,6 +242,34 @@ async function safeFetchWithRetry(url, options = {}, maxRetries = 3) {
     }
 }
 
+// Ensures interaction is always acknowledged - defers if possible, replies with fallback if defer fails
+async function ensureInteractionAcknowledged(interaction, options = {}) {
+    if (interaction.replied || interaction.deferred || (typeof interaction.isAcknowledged === 'function' && interaction.isAcknowledged())) {
+        return { acknowledged: true, deferred: interaction.deferred };
+    }
+    
+    try {
+        await interaction.deferReply(options);
+        return { acknowledged: true, deferred: true };
+    } catch (err) {
+        // If defer fails (likely due to HF timeout), try a fallback reply
+        const isTimeout = err.message?.includes('Connect Timeout') || err.message?.includes('ECONNREFUSED') || err.code === 'UND_ERR_CONNECT_TIMEOUT';
+        if (isTimeout) {
+            // Silently try a direct reply as fallback
+            try {
+                await interaction.reply({ content: '⏳ Processing...', ...options, ephemeral: true });
+                return { acknowledged: true, deferred: false };
+            } catch (replyErr) {
+                // Even reply failed, nothing we can do
+                return { acknowledged: false, deferred: false };
+            }
+        }
+        // Non-timeout error
+        console.error('>>> [ERROR] Failed to acknowledge interaction:', err.message);
+        return { acknowledged: false, deferred: false };
+    }
+}
+
 const safeInteractionReply = safeReply;
 const safeInteractionEditReply = safeEditReply;
 const safeInteractionDeferReply = safeDeferReply;
@@ -264,5 +292,6 @@ module.exports = {
     safeMessageReply,
     safeChannelSend,
     safeUserSend,
-    safeMessageEdit
+    safeMessageEdit,
+    ensureInteractionAcknowledged
 };
