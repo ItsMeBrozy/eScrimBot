@@ -2067,10 +2067,69 @@ ${questions[0]}`);
                     await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
-                    // Find which queue channel the user is in
+                    // Check for active matches in pre_vc, choosing_method, voting, or picking status
+                    const activeMatch = await Match.findOne({
+                        guildId: guild.id,
+                        status: { $in: ['pre_vc', 'choosing_method', 'voting', 'picking'] }
+                    });
+
+                    if (activeMatch) {
+                        // Check all three VCs for missing players
+                        const playerIds = activeMatch.remainingPlayers ? activeMatch.remainingPlayers.split(',') : [];
+                        const teamAIds = activeMatch.teamA ? activeMatch.teamA.split(',') : [];
+                        const teamBIds = activeMatch.teamB ? activeMatch.teamB.split(',') : [];
+
+                        const alerts = [];
+
+                        // Check pre-match VC
+                        if (activeMatch.playersVcId) {
+                            const preVc = guild.channels.cache.get(activeMatch.playersVcId) || await guild.channels.fetch(activeMatch.playersVcId).catch(() => null);
+                            if (preVc) {
+                                const missingInPre = playerIds.filter(id => !preVc.members.has(id));
+                                if (missingInPre.length > 0) {
+                                    alerts.push(`**Pre-Match VC**: ${missingInPre.length} player(s) missing - ${missingInPre.map(id => `<@${id}>`).join(', ')}`);
+                                }
+                            }
+                        }
+
+                        // Check Team A VC
+                        if (activeMatch.teamAVcId && teamAIds.length > 0) {
+                            const teamAVc = guild.channels.cache.get(activeMatch.teamAVcId) || await guild.channels.fetch(activeMatch.teamAVcId).catch(() => null);
+                            if (teamAVc) {
+                                const missingInTeamA = teamAIds.filter(id => !teamAVc.members.has(id));
+                                if (missingInTeamA.length > 0) {
+                                    alerts.push(`**Team A VC**: ${missingInTeamA.length} player(s) missing - ${missingInTeamA.map(id => `<@${id}>`).join(', ')}`);
+                                }
+                            }
+                        }
+
+                        // Check Team B VC
+                        if (activeMatch.teamBVcId && teamBIds.length > 0) {
+                            const teamBVc = guild.channels.cache.get(activeMatch.teamBVcId) || await guild.channels.fetch(activeMatch.teamBVcId).catch(() => null);
+                            if (teamBVc) {
+                                const missingInTeamB = teamBIds.filter(id => !teamBVc.members.has(id));
+                                if (missingInTeamB.length > 0) {
+                                    alerts.push(`**Team B VC**: ${missingInTeamB.length} player(s) missing - ${missingInTeamB.map(id => `<@${id}>`).join(', ')}`);
+                                }
+                            }
+                        }
+
+                        if (alerts.length > 0) {
+                            const checkEmbed = new EmbedBuilder()
+                                .setTitle(`🔍 Substitution Check — Match #${activeMatch.matchId}`)
+                                .setDescription(alerts.join('\n\n'))
+                                .setColor('#FEE75C')
+                                .setTimestamp();
+                            return safeInteractionEditReply(interaction, { embeds: [checkEmbed] });
+                        } else {
+                            return safeInteractionEditReply(interaction, { content: '✅ All players are in their respective voice channels!' });
+                        }
+                    }
+
+                    // If no active match, check queue status
                     const playerEntry = await ActiveQueuePlayer.findOne({ guildId: guild.id, userId: user.id });
                     if (!playerEntry) {
-                        return safeInteractionEditReply(interaction, { content: '❌ You are not currently in any queue!' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                        return safeInteractionEditReply(interaction, { content: '❌ No active match found, and you are not in any queue!' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                     }
 
                     const queueChannelId = playerEntry.channelId;
