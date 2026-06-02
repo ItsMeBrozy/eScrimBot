@@ -684,7 +684,7 @@ async function finalizeTeams(client, match) {
 
 async function handleQueueInteraction(interaction, client) {
     if (!interaction.isButton()) return;
-    console.log(`>>> [INTERACTION] Button ${interaction.customId} used by ${interaction.user.tag}`);
+    // Suppress verbose interaction logging to reduce log noise
     const [action, ...args] = interaction.customId.split('_');
 
     // --- SUBSTITUTE BUTTON HANDLERS ---

@@ -175,10 +175,18 @@ async function safeMessageEdit(message, response) {
     if (!message || typeof message.edit !== 'function') return null;
     try {
         return await message.edit(response).catch(err => {
+            // Suppress non-fatal HF Spaces network errors
+            if (err.message?.includes('Connect Timeout') || err.message?.includes('ECONNREFUSED') || err.code === 'UND_ERR_CONNECT_TIMEOUT') {
+                return null; // Silently ignore — HF network blip
+            }
             console.error('>>> [ERROR] Message edit failed:', err.message);
             return null;
         });
     } catch (err) {
+        // Suppress timeout errors in catch block too
+        if (err.message?.includes('Connect Timeout') || err.message?.includes('ECONNREFUSED') || err.code === 'UND_ERR_CONNECT_TIMEOUT') {
+            return null;
+        }
         console.error('>>> [ERROR] Message edit catch:', err.message);
         return null;
     }
