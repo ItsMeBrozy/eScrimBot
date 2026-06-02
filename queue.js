@@ -1,4 +1,4 @@
-const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, PermissionFlagsBits, StringSelectMenuBuilder } = require('discord.js');
+const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, PermissionFlagsBits, StringSelectMenuBuilder, MessageFlags } = require('discord.js');
 const { QueueConfig, ActiveQueuePlayer, GuildSettings, Match, PointHistory, BlacklistedUser } = require('./models');
 const { safeChannelSend, safeMessageEdit, safeInteractionDeferReply, safeInteractionReply, safeInteractionEditReply, safeInteractionFollowUp } = require('./safe-utils');
 
@@ -693,7 +693,7 @@ async function handleQueueInteraction(interaction, client) {
         const queueChannelId = args[1];
         const originalUserId = args[2];
 
-        await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+        await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
         if (!interaction.deferred && !interaction.replied) return;
 
         // Check if the substitute is the same person who requested it
@@ -863,7 +863,7 @@ async function handleQueueInteraction(interaction, client) {
     }
 
     if (interaction.customId === 'join_queue') {
-        await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+        await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
         if (!interaction.deferred && !interaction.replied) return;
 
         if (queueLocks.has(interaction.guild.id)) {
@@ -948,7 +948,7 @@ async function handleQueueInteraction(interaction, client) {
     }
 
     if (interaction.customId === 'leave_queue') {
-        await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+        await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
         if (!interaction.deferred && !interaction.replied) return;
         console.log(`>>> [QUEUE] ${interaction.user.tag} attempting to leave queue in ${interaction.guild.name}`);
         

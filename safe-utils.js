@@ -110,6 +110,10 @@ async function safeDeferReply(interaction, options = {}) {
         await interaction.deferReply(options);
         return true;
     } catch (err) {
+        // Suppress non-fatal HF Spaces network errors
+        if (err.message?.includes('Connect Timeout') || err.message?.includes('ECONNREFUSED') || err.code === 'UND_ERR_CONNECT_TIMEOUT') {
+            return false; // Silently ignore — HF network blip, not a real bug
+        }
         console.error('>>> [ERROR] Safe defer failed:', err.message);
         return false;
     }

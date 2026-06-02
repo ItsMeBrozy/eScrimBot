@@ -3,7 +3,7 @@ process.on('uncaughtException', (err) => { console.error('>>> [CRITICAL] Uncaugh
 
 // Server starts IMMEDIATELY on require() — port 7860 opens before anything else
 const { setClient } = require('./server');
-const { Client, GatewayIntentBits, Partials, ChannelType, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, REST, Routes, StringSelectMenuBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, ChannelType, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, REST, Routes, StringSelectMenuBuilder, MessageFlags } = require('discord.js');
 const { ProxyAgent } = require('undici');
 const mongoose = require('mongoose');
 const { Hub, TempChannel, LfmMessage, GuildSettings, UserPoints, QueueConfig, ActiveQueuePlayer, Match, PointHistory, Permission, VerifiedUser, BlacklistedUser, Application } = require('./models');
@@ -1272,7 +1272,7 @@ ${questions[0]}`);
                 }
 
                 if (commandName === 'set-leaderboard') {
-                    await safeInteractionDeferReply(interaction, { ephemeral: true });
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral });
 
                     const oldSettings = await GuildSettings.findOne({ guildId: guild.id });
                     const oldChannelId = oldSettings?.leaderboardChannelId;
@@ -1305,7 +1305,7 @@ ${questions[0]}`);
                     return safeInteractionEditReply(interaction, { content: `✅ Leaderboard has been set to ${channel}!` });
                 }
                 if (commandName === 'set-permissions') {
-                    await safeInteractionDeferReply(interaction, { ephemeral: true });
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral });
 
                     const roleInput = options.getString('role');
                     const processRole = (str) => {
@@ -1344,7 +1344,7 @@ ${questions[0]}`);
                     return safeInteractionEditReply(interaction, { content: `✅ Permissions updated! <@&${roleId}> now has access to: \`${commandsArray.join(', ') || 'None'}\`` });
                 }
                 if (commandName === 'permissions-info') {
-                    await safeInteractionDeferReply(interaction, { ephemeral: true });
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral });
 
                     const lines = [];
                     for (const [cmd, roles] of Object.entries(permissions)) {
@@ -1363,7 +1363,7 @@ ${questions[0]}`);
                     return safeInteractionEditReply(interaction, { embeds: [embed] });
                 }
                 if (commandName === 'setup') {
-                    await safeInteractionDeferReply(interaction, { ephemeral: true });
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral });
 
                     const embed = new EmbedBuilder()
                         .setTitle('🚀 eScrims Bot Setup')
@@ -1377,7 +1377,7 @@ ${questions[0]}`);
                     return safeInteractionEditReply(interaction, { embeds: [embed] });
                 }
                 if (commandName === 'verify') {
-                    await safeInteractionDeferReply(interaction, { ephemeral: true });
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral });
 
                     // 1. Try Bloxlink verification
                     const bloxlinkResult = await tryBloxlinkVerify(member, guild, client);
@@ -1394,7 +1394,7 @@ ${questions[0]}`);
                     }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                 }
                 if (commandName === 'queue-enable') {
-                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const interval = options.getInteger('interval');
@@ -1426,7 +1426,7 @@ ${questions[0]}`);
                     return safeInteractionEditReply(interaction, { content: `✅ Queue system configured! Messages will be sent in ${channel} every ${interval} minutes.` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                 }
                 if (commandName === 'queue-disable') {
-                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const key = `${guild.id}_${channel.id}`;
@@ -1531,7 +1531,7 @@ ${questions[0]}`);
                     return safeInteractionEditReply(interaction, result).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                 }
                 if (commandName === 'go') {
-                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     await QueueConfig.findOneAndUpdate(
@@ -1831,7 +1831,7 @@ ${questions[0]}`);
                 }
                 if (commandName === 'ping') {
                     const start = Date.now();
-                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const latency = Date.now() - start;
@@ -1866,7 +1866,7 @@ ${questions[0]}`);
                     return safeInteractionEditReply(interaction, { content: `✅ Removed **${amount}** points from <@${target.id}>. They now have **${data.points.toFixed(1)}** points.` });
                 }
                 if (commandName === 'ppq') {
-                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const playersCount = options.getInteger('players');
@@ -1883,7 +1883,7 @@ ${questions[0]}`);
                     return safeInteractionEditReply(interaction, { content: `✅ Required players for queue in this channel set to **${playersCount}**.` });
                 }
                 if (commandName === 'startqueue') {
-                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const forcedMatchId = options.getInteger('queuenumber');
@@ -1932,7 +1932,7 @@ ${questions[0]}`);
                     }
                 }
                 if (commandName === 'renew_queue_players') {
-                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const matchId = options.getInteger('queuenumber');
@@ -1998,7 +1998,7 @@ ${questions[0]}`);
                     }
                 }
                 if (commandName === 'blacklist') {
-                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const targetUser = options.getUser('user');
@@ -2071,7 +2071,7 @@ ${questions[0]}`);
                     }
                 }
                 if (commandName === 'substitute') {
-                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     // Check for active matches in pre_vc, choosing_method, voting, or picking status
@@ -2169,7 +2169,7 @@ ${questions[0]}`);
                     return safeInteractionEditReply(interaction, { content: '✅ You have been removed from the queue and a substitution request has been posted.' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                 }
                 if (commandName === 'substitutes') {
-                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { flags: MessageFlags.Ephemeral }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const activeMatch = await Match.findOne({ guildId: guild.id, status: 'pre_vc' });
