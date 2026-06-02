@@ -1,5 +1,6 @@
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, PermissionFlagsBits, StringSelectMenuBuilder } = require('discord.js');
 const { QueueConfig, ActiveQueuePlayer, GuildSettings, Match, PointHistory, BlacklistedUser } = require('./models');
+const { safeChannelSend, safeMessageEdit, safeInteractionDeferReply, safeInteractionReply, safeInteractionEditReply, safeInteractionFollowUp } = require('./safe-utils');
 
 const queueIntervals = new Map();
 const methodTimeouts = new Map();
@@ -24,9 +25,9 @@ async function sendQueueMessage(client, guildId, channelId, forceNew = false, sh
         const config = await QueueConfig.findOne({ guildId, channelId });
         if (!config) return;
 
-        const guild = await client.guilds.fetch(guildId).catch(() => null);
+        const guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
         if (!guild) return;
-        const channel = await guild.channels.fetch(config.channelId).catch(() => null);
+        const channel = guild.channels.cache.get(config.channelId) || await guild.channels.fetch(config.channelId).catch(() => null);
         if (!channel) return;
 
         const players = await ActiveQueuePlayer.find({ guildId, channelId });
@@ -63,12 +64,14 @@ async function sendQueueMessage(client, guildId, channelId, forceNew = false, sh
         if (lastMsg) {
             const editOptions = { embeds: [embed], components: [row] };
             if (shouldPing) editOptions.content = '@everyone';
-            await lastMsg.edit(editOptions);
+            await safeMessageEdit(lastMsg, editOptions);
         } else {
             const sendOptions = { embeds: [embed], components: [row] };
             if (shouldPing) sendOptions.content = '@everyone';
-            const newMsg = await channel.send(sendOptions);
-            await QueueConfig.updateOne({ guildId, channelId }, { lastMessageId: newMsg.id });
+            const newMsg = await safeChannelSend(channel, sendOptions);
+            if (newMsg && newMsg.id) {
+                await QueueConfig.updateOne({ guildId, channelId }, { lastMessageId: newMsg.id });
+            }
         }
     } catch (error) {
         if (_retryCount < 3) {
@@ -121,7 +124,7 @@ async function createMatch(guild, playerDocs, settings, forcedMatchId = null) {
 
         // Assign role to all players
         for (const playerId of playerIds) {
-            const member = await guild.members.fetch(playerId).catch(() => null);
+            const member = guild.members.cache.get(playerId) || await guild.members.fetch(playerId).catch(() => null);
             if (member) {
                 await member.roles.add(matchRole).catch(err => console.error(`>>> [ROLE] Failed to add role to ${playerId}:`, err.message));
             }
@@ -192,7 +195,7 @@ async function createMatch(guild, playerDocs, settings, forcedMatchId = null) {
         const embed = new EmbedBuilder()
             .setTitle(`🎮 MATCH #${matchId} IS READY!`)
             .setColor('#FEE75C')
-            .setDescription(`**A new match has been initialized.**\n\n⚠️ **IMPORTANT:** All players must join the voice channel below to start captain selection.\n\n**Join here:** ${playersVc}\n\n**Player Status:**\n${statusList}\n\n**Total in VC:** 0/${playerIds.length}`)
+            .setDescription(`**A new match has been initialized.**\n\n🚫 **Chat is currently locked** for queue role members until teams are assigned and moved into their Team VCs.\n\n⚠️ **IMPORTANT:** All players must join the voice channel below to start captain selection.\n\n**Join here:** ${playersVc}\n\n**Player Status:**\n${statusList}\n\n**Total in VC:** 0/${playerIds.length}`)
             .setTimestamp()
             .setFooter({ text: 'Waiting for players to join VC...' });
 
@@ -200,6 +203,8 @@ async function createMatch(guild, playerDocs, settings, forcedMatchId = null) {
             content: `<@&${matchRole.id}>`, 
             embeds: [embed] 
         }));
+
+        await retryPromise(() => lounge.send(`🚫 Chat is locked for this match until teams are assigned and moved to their Team VCs. Stay in the VC and wait for the next update.`)).catch(() => {});
 
         await Match.updateOne({ _id: matchDoc._id }, { preMatchMsgId: announcement.id });
 
@@ -661,6 +666,12 @@ async function finalizeTeams(client, match) {
 
         // Unlock chat now that teams are set and players are in their VCs
         if (lounge && match.roleId) {
+            // Allow everyone to view the lounge
+            await lounge.permissionOverwrites.edit(match.guildId, {
+                ViewChannel: true
+            }).catch(err => console.error('>>> [PERMISSION] Failed to unlock lounge view for everyone:', err.message));
+            
+            // Allow the queue role to send messages
             await lounge.permissionOverwrites.edit(match.roleId, {
                 SendMessages: true
             }).catch(err => console.error('>>> [PERMISSION] Failed to unlock lounge chat:', err.message));
@@ -682,12 +693,12 @@ async function handleQueueInteraction(interaction, client) {
         const queueChannelId = args[1];
         const originalUserId = args[2];
 
-        await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+        await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
         if (!interaction.deferred && !interaction.replied) return;
 
         // Check if the substitute is the same person who requested it
         if (interaction.user.id === originalUserId) {
-            return interaction.editReply({ content: '❌ You cannot substitute yourself!' });
+            return safeInteractionEditReply(interaction, { content: '❌ You cannot substitute yourself!' });
         }
 
         // Check if player is blacklisted
@@ -695,20 +706,20 @@ async function handleQueueInteraction(interaction, client) {
         const isBlacklisted = await BlacklistedUser.findOne({ userId: interaction.user.id, guildId: interaction.guild.id });
         const hasBlacklistRole = interaction.member.roles.cache.has('1503814587877949632');
         if (hasBlacklistRole || (isBlacklisted && isBlacklisted.expiresAt > new Date())) {
-            return interaction.editReply({ content: '❌ You are blacklisted from joining queues!' });
+            return safeInteractionEditReply(interaction, { content: '❌ You are blacklisted from joining queues!' });
         }
 
         // Check if they're already in a queue
         const alreadyInQueue = await ActiveQueuePlayer.findOne({ guildId: interaction.guild.id, userId: interaction.user.id });
         if (alreadyInQueue) {
-            return interaction.editReply({ content: '❌ You are already in a queue!' });
+            return safeInteractionEditReply(interaction, { content: '❌ You are already in a queue!' });
         }
 
         // Add the substitute to the queue
         try {
             await ActiveQueuePlayer.create({ guildId: interaction.guild.id, channelId: queueChannelId, userId: interaction.user.id });
         } catch (err) {
-            return interaction.editReply({ content: '❌ Failed to join the queue. You may already be in it.' });
+            return safeInteractionEditReply(interaction, { content: '❌ Failed to join the queue. You may already be in it.' });
         }
 
         // Update the queue message
@@ -722,7 +733,7 @@ async function handleQueueInteraction(interaction, client) {
             .setTimestamp();
 
         await interaction.message.edit({ content: null, embeds: [claimedEmbed], components: [] }).catch(() => {});
-        await interaction.editReply({ content: '✅ You have been added to the queue as a substitute!' });
+        await safeInteractionEditReply(interaction, { content: '✅ You have been added to the queue as a substitute!' });
 
         // Check if queue is now full and should start
         const config = await QueueConfig.findOne({ guildId: interaction.guild.id, channelId: queueChannelId });
@@ -764,7 +775,7 @@ async function handleQueueInteraction(interaction, client) {
     if (action === 'refresh' && args[0] === 'stats') {
         const targetId = args[1];
         const target = await client.users.fetch(targetId).catch(() => null);
-        if (!target) return interaction.reply({ content: '❌ User not found.', ephemeral: true });
+        if (!target) return safeInteractionReply(interaction, { content: '❌ User not found.', ephemeral: true });
 
         const { getStatsEmbed } = require('./stats');
         const stats = await getStatsEmbed(target, interaction.guild.id, client);
@@ -777,7 +788,7 @@ async function handleQueueInteraction(interaction, client) {
         if (!match || match.status !== 'choosing_method') return;
 
         const playerIds = match.remainingPlayers ? match.remainingPlayers.split(',') : [];
-        if (!playerIds.includes(interaction.user.id)) return interaction.reply({ content: '❌ You are not in this match!', ephemeral: true });
+        if (!playerIds.includes(interaction.user.id)) return safeInteractionReply(interaction, { content: '❌ You are not in this match!', ephemeral: true });
 
         if (!match.methodVotes) match.methodVotes = new Map();
         match.methodVotes.set(interaction.user.id, type);
@@ -805,7 +816,7 @@ async function handleQueueInteraction(interaction, client) {
         if (!match || match.status !== 'voting') return;
 
         const playerIds = match.remainingPlayers ? match.remainingPlayers.split(',') : [];
-        if (!playerIds.includes(interaction.user.id)) return interaction.reply({ content: '❌ You are not in this match!', ephemeral: true });
+        if (!playerIds.includes(interaction.user.id)) return safeInteractionReply(interaction, { content: '❌ You are not in this match!', ephemeral: true });
 
         if (!match.votes) match.votes = new Map();
         match.votes.set(interaction.user.id, targetId);
@@ -832,7 +843,7 @@ async function handleQueueInteraction(interaction, client) {
         const match = await Match.findById(matchId);
         if (!match || match.status !== 'picking') return;
 
-        if (interaction.user.id !== match.turnId) return interaction.reply({ content: '❌ It is not your turn!', ephemeral: true });
+        if (interaction.user.id !== match.turnId) return safeInteractionReply(interaction, { content: '❌ It is not your turn!', ephemeral: true });
 
         const isC1 = interaction.user.id === match.captain1Id;
         const teamKey = isC1 ? 'teamA' : 'teamB';
@@ -852,11 +863,11 @@ async function handleQueueInteraction(interaction, client) {
     }
 
     if (interaction.customId === 'join_queue') {
-        await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+        await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
         if (!interaction.deferred && !interaction.replied) return;
 
         if (queueLocks.has(interaction.guild.id)) {
-            return interaction.editReply({ content: '⏳ Please wait, another player is joining...' });
+            return safeInteractionEditReply(interaction, { content: '⏳ Please wait, another player is joining...' });
         }
         queueLocks.add(interaction.guild.id);
 
@@ -877,7 +888,7 @@ async function handleQueueInteraction(interaction, client) {
                     await interaction.member.roles.add('1503814587877949632').catch(() => {});
                 }
                 queueLocks.delete(interaction.guild.id);
-                return interaction.editReply({ content: '❌ You are blacklisted from joining queues!' });
+                return safeInteractionEditReply(interaction, { content: '❌ You are blacklisted from joining queues!' });
             }
 
             // Lazy cleanup of expired blacklist
@@ -892,13 +903,13 @@ async function handleQueueInteraction(interaction, client) {
             
             if (players.some(p => p.userId === interaction.user.id)) {
                 queueLocks.delete(interaction.guild.id);
-                return interaction.editReply({ content: '❌ Already in queue!' });
+                return safeInteractionEditReply(interaction, { content: '❌ Already in queue!' });
             }
             
             await ActiveQueuePlayer.create({ guildId: interaction.guild.id, channelId: interaction.channel.id, userId: interaction.user.id });
             const newPlayers = await ActiveQueuePlayer.find({ guildId: interaction.guild.id, channelId: interaction.channel.id });
 
-            await interaction.editReply({ content: `✅ Joined! (${newPlayers.length}/${reqPlayers})` });
+            await safeInteractionEditReply(interaction, { content: `✅ Joined! (${newPlayers.length}/${reqPlayers})` });
             await sendQueueMessage(client, interaction.guild.id, interaction.channel.id);
 
             if (newPlayers.length >= reqPlayers) {
@@ -937,12 +948,12 @@ async function handleQueueInteraction(interaction, client) {
     }
 
     if (interaction.customId === 'leave_queue') {
-        await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+        await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
         if (!interaction.deferred && !interaction.replied) return;
         console.log(`>>> [QUEUE] ${interaction.user.tag} attempting to leave queue in ${interaction.guild.name}`);
         
         await ActiveQueuePlayer.deleteOne({ guildId: interaction.guild.id, channelId: interaction.channel.id, userId: interaction.user.id });
-        await interaction.editReply({ content: '✅ Left queue.' });
+        await safeInteractionEditReply(interaction, { content: '✅ Left queue.' });
         await sendQueueMessage(client, interaction.guild.id, interaction.channel.id);
     }
 }
@@ -1079,7 +1090,7 @@ async function handleSubRequestInteraction(interaction, client) {
         const match = await Match.findById(matchId);
         if (!match) {
             if (interaction.isRepliable()) {
-                await interaction.reply({ content: '❌ Match not found.', ephemeral: true }).catch(() => {});
+                await safeInteractionReply(interaction, { content: '❌ Match not found.', ephemeral: true }).catch(() => {});
             }
             return true;
         }
@@ -1090,13 +1101,13 @@ async function handleSubRequestInteraction(interaction, client) {
         const isBlacklisted = await BlacklistedUser.findOne({ userId: interaction.user.id, guildId: guild.id });
         const hasBlacklistRole = interaction.member.roles.cache.has('1503814587877949632');
         if (hasBlacklistRole || (isBlacklisted && isBlacklisted.expiresAt > new Date())) {
-            await interaction.reply({ content: '❌ You are blacklisted from joining queues/matches!', ephemeral: true }).catch(() => {});
+            await safeInteractionReply(interaction, { content: '❌ You are blacklisted from joining queues/matches!', ephemeral: true }).catch(() => {});
             return true;
         }
 
         const playerIds = match.remainingPlayers ? match.remainingPlayers.split(',') : [];
         if (playerIds.includes(interaction.user.id)) {
-            await interaction.reply({ content: '❌ You are already a player in this match!', ephemeral: true }).catch(() => {});
+            await safeInteractionReply(interaction, { content: '❌ You are already a player in this match!', ephemeral: true }).catch(() => {});
             return true;
         }
 
@@ -1111,13 +1122,13 @@ async function handleSubRequestInteraction(interaction, client) {
             ]
         });
         if (activeMatch && activeMatch._id.toString() !== match._id.toString()) {
-            await interaction.reply({ content: '❌ You are already playing or queued in another active match!', ephemeral: true }).catch(() => {});
+            await safeInteractionReply(interaction, { content: '❌ You are already playing or queued in another active match!', ephemeral: true }).catch(() => {});
             return true;
         }
 
         const vc = guild.channels.cache.get(match.playersVcId) || await guild.channels.fetch(match.playersVcId).catch(() => null);
         if (!vc) {
-            await interaction.reply({ content: '❌ Pre-match voice channel not found.', ephemeral: true }).catch(() => {});
+            await safeInteractionReply(interaction, { content: '❌ Pre-match voice channel not found.', ephemeral: true }).catch(() => {});
             return true;
         }
 
@@ -1125,7 +1136,7 @@ async function handleSubRequestInteraction(interaction, client) {
             const missingPlayers = playerIds.filter(id => !vc.members.has(id));
 
             if (missingPlayers.length === 0) {
-                await interaction.reply({ content: '❌ Everyone is currently in the voice channel! No substitutes are needed.', ephemeral: true }).catch(() => {});
+                await safeInteractionReply(interaction, { content: '❌ Everyone is currently in the voice channel! No substitutes are needed.', ephemeral: true }).catch(() => {});
                 return true;
             }
 
@@ -1146,7 +1157,7 @@ async function handleSubRequestInteraction(interaction, client) {
                 .addOptions(options);
 
             const row = new ActionRowBuilder().addComponents(selectMenu);
-            await interaction.reply({ content: 'Select which missing player you want to substitute for:', components: [row], ephemeral: true }).catch(() => {});
+            await safeInteractionReply(interaction, { content: 'Select which missing player you want to substitute for:', components: [row], ephemeral: true }).catch(() => {});
             return true;
         }
 
@@ -1159,12 +1170,12 @@ async function handleSubRequestInteraction(interaction, client) {
             const currentPlayerIds = currentMatch.remainingPlayers ? currentMatch.remainingPlayers.split(',') : [];
             
             if (!currentPlayerIds.includes(oldPlayerId)) {
-                await interaction.reply({ content: '❌ That player has already been replaced.', ephemeral: true }).catch(() => {});
+                await safeInteractionReply(interaction, { content: '❌ That player has already been replaced.', ephemeral: true }).catch(() => {});
                 return true;
             }
 
             if (vc.members.has(oldPlayerId)) {
-                await interaction.reply({ content: '❌ That player is now in the voice channel and cannot be replaced.', ephemeral: true }).catch(() => {});
+                await safeInteractionReply(interaction, { content: '❌ That player is now in the voice channel and cannot be replaced.', ephemeral: true }).catch(() => {});
                 return true;
             }
 
@@ -1185,7 +1196,7 @@ async function handleSubRequestInteraction(interaction, client) {
                 await lounge.send({ content: `🔄 **Substitution:** <@${interaction.user.id}> has replaced <@${oldPlayerId}> in the match!` }).catch(() => {});
             }
 
-            await interaction.reply({ content: `✅ You have successfully replaced <@${oldPlayerId}>!`, ephemeral: true }).catch(() => {});
+            await safeInteractionReply(interaction, { content: `✅ You have successfully replaced <@${oldPlayerId}>!`, ephemeral: true }).catch(() => {});
 
             const subChannel = client.channels.cache.get(SUB_CHANNEL_ID) || await client.channels.fetch(SUB_CHANNEL_ID).catch(() => null);
             if (subChannel && currentMatch.subMessageId) {
@@ -1236,9 +1247,9 @@ async function checkAndHandleFriendlyBlacklist(interaction, userId) {
         const isBlacklisted = await BlacklistedUser.findOne({ userId, guildId: interaction.guild.id });
         if (isBlacklisted && isBlacklisted.isFriendlyBlacklist) {
             if (interaction.deferred || interaction.replied) {
-                await interaction.editReply({ content: '❌ You are blacklisted from playing 1 friendly.' }).catch(() => {});
+                await safeInteractionEditReply(interaction, { content: '❌ You are blacklisted from playing 1 friendly.' }).catch(() => {});
             } else {
-                await interaction.reply({ content: '❌ You are blacklisted from playing 1 friendly.', ephemeral: true }).catch(() => {});
+                await safeInteractionReply(interaction, { content: '❌ You are blacklisted from playing 1 friendly.', ephemeral: true }).catch(() => {});
             }
             const scrimsMsg = await interaction.channel.send(`<@${userId}> Your blacklisted from playing 1 friendly`).catch(() => null);
             if (scrimsMsg) {

@@ -1,6 +1,6 @@
 const express = require('express');
 const app = express();
-const port = process.env.PORT || 5000;
+const port = process.env.PORT || 7860; // HF Spaces uses port 7860
 
 // Log buffer to store live console logs for web diagnostics
 const logBuffer = [];
@@ -53,8 +53,18 @@ app.get('/logs', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-    // Always return 200 so HF Spaces doesn't pause us
-    res.status(200).send(botClient?.isReady() ? 'OK' : 'Starting...');
+    // Always return 200 immediately so HF Spaces keeps us alive
+    // Bot initializes in background
+    res.status(200).send('OK');
+});
+
+app.get('/status', (req, res) => {
+    // Detailed status for monitoring (non-blocking)
+    res.status(200).json({
+        status: botClient?.isReady() ? 'online' : 'starting',
+        bot: botClient?.user ? botClient.user.tag : 'Initializing...',
+        uptime: Math.floor(process.uptime()) + 's'
+    });
 });
 
 // Start listening IMMEDIATELY on require() — this is critical for HF Spaces

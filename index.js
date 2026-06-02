@@ -4,11 +4,61 @@ process.on('uncaughtException', (err) => { console.error('>>> [CRITICAL] Uncaugh
 // Server starts IMMEDIATELY on require() — port 7860 opens before anything else
 const { setClient } = require('./server');
 const { Client, GatewayIntentBits, Partials, ChannelType, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, REST, Routes, StringSelectMenuBuilder } = require('discord.js');
+const { ProxyAgent } = require('undici');
 const mongoose = require('mongoose');
 const { Hub, TempChannel, LfmMessage, GuildSettings, UserPoints, QueueConfig, ActiveQueuePlayer, Match, PointHistory, Permission, VerifiedUser, BlacklistedUser, Application } = require('./models');
 const { getStatsEmbed, getSearchEmbed } = require('./stats');
+const { safeFetch, createDiscordRestAdapter, safeInteractionReply, safeInteractionEditReply, safeInteractionDeferReply, safeInteractionFollowUp, safeMessageReply, safeChannelSend, safeUserSend } = require('./safe-utils');
 const fs = require('fs');
 require('dotenv').config();
+
+function canAcknowledgeInteraction(interaction) {
+    return interaction.replied || interaction.deferred || (typeof interaction.isAcknowledged === 'function' && interaction.isAcknowledged());
+}
+
+async function safeDeferReply(interaction, options = {}) {
+    if (canAcknowledgeInteraction(interaction)) return false;
+    try {
+        await safeInteractionDeferReply(interaction, options);
+        return true;
+    } catch (err) {
+        console.error('>>> [ERROR] Defer failed:', err.message);
+        return false;
+    }
+}
+
+async function safeReply(interaction, response) {
+    if (!interaction?.isRepliable?.()) return null;
+    try {
+        if (interaction.replied || interaction.deferred || (typeof interaction.isAcknowledged === 'function' && interaction.isAcknowledged())) {
+            return await safeInteractionFollowUp(interaction, response);
+        }
+        return await safeInteractionReply(interaction, response);
+    } catch (err) {
+        console.error('>>> [ERROR] Safe reply failed:', err.message);
+        return null;
+    }
+}
+
+async function safeEditReply(interaction, response) {
+    if (!interaction?.isRepliable?.()) return null;
+    try {
+        if (interaction.replied || interaction.deferred || (typeof interaction.isAcknowledged === 'function' && interaction.isAcknowledged())) {
+            return await safeInteractionEditReply(interaction, response);
+        }
+        return await safeInteractionReply(interaction, response);
+    } catch (err) {
+        console.error('>>> [ERROR] Safe edit failed:', err.message);
+        if (interaction.replied || interaction.deferred || (typeof interaction.isAcknowledged === 'function' && interaction.isAcknowledged())) {
+            try {
+                return await safeInteractionFollowUp(interaction, response);
+            } catch (err2) {
+                console.error('>>> [ERROR] Follow-up after failed editReply also failed:', err2.message);
+            }
+        }
+        return null;
+    }
+}
 
 const APP_DATA = {
     'Staff': {
@@ -152,6 +202,7 @@ const ALLOWED_GUILDS = ['1503745265285464084', '1504397530765721630'];
 const matchMvpVotes = new Map();
 const matchLocks = new Set();
 const lastVcPlayers = new Map();
+const suppressMidGameLeaveNotify = new Set();
 // --- Slash Commands Metadata ---
 const slashCommands = [
     { name: 'send-apps', description: 'Send an application request to a user', options: [
@@ -223,11 +274,12 @@ async function tryBloxlinkVerify(member, guild, client) {
     if (!apiKey) return null;
 
     try {
-        const res = await fetch(`https://api.blox.link/v4/public/guilds/${guild.id}/discord-to-roblox/${member.id}`, {
-            headers: { 'Authorization': apiKey }
-        });
+        const res = await safeFetch(`https://api.blox.link/v4/public/guilds/${guild.id}/discord-to-roblox/${member.id}`, {
+            headers: { 'Authorization': apiKey },
+            timeout: 18000
+        }).catch(() => null);
 
-        if (!res.ok) return null;
+        if (!res || !res.ok) return null;
 
         const data = await res.json();
         const robloxIdStr = data.robloxID || (data.resolved && data.resolved.roblox && data.resolved.roblox.id);
@@ -237,7 +289,7 @@ async function tryBloxlinkVerify(member, guild, client) {
         if (isNaN(robloxId)) return null;
 
         // Fetch Roblox username from Roblox Users API
-        const userRes = await fetch(`https://users.roblox.com/v1/users/${robloxId}`).catch(() => null);
+        const userRes = await safeFetch(`https://users.roblox.com/v1/users/${robloxId}`, { timeout: 18000 }).catch(() => null);
         if (!userRes || !userRes.ok) return null;
 
         const userData = await userRes.json();
@@ -303,21 +355,34 @@ async function start() {
     let updateLeaderboard;
 
     // === STEP 1: Create Discord Client ===
-    const { Agent } = require('undici');
+    const proxyUri = process.env.PROXY_URL;
+    
+    if (!proxyUri) {
+        console.error(">>> [WARN] PROXY_URL environment variable is missing!");
+    }
+
+    const proxyAgent = proxyUri ? new ProxyAgent({ uri: proxyUri }) : null;
+    
     const clientOptions = {
         intents: [
             GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
             GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates,
             GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.DirectMessages
         ],
-        partials: [Partials.Message, Partials.Channel, Partials.Reaction]
+        partials: [Partials.Message, Partials.Channel, Partials.Reaction],
+        rest: {
+            timeout: 30000,
+            makeRequestFetchAdapter: createDiscordRestAdapter(proxyAgent)
+        }
     };
     
     let client = new Client(clientOptions);
     setClient(client);
 
-    // Increase timeout for the REST client (to avoid timeout on Hugging Face)
-    client.rest.setAgent(new Agent({ connect: { timeout: 60000 } }));
+    client.rest.on('rateLimited', (info) => {
+        const route = info.route || info.path || info.method || 'unknown';
+        console.warn(`>>> [REST] Rate limited on route: ${route}. Limit: ${info.limit}, Timeout: ${info.timeToReset}ms`);
+    });
 
     // === STEP 4: Setup Event Handlers ===
     client.once('ready', async () => {
@@ -417,8 +482,9 @@ async function start() {
                             }
                         }
 
-                        // If all players are in VC, start captain selection
+                        // If all players are in VC and the state changed from before, start captain selection once
                         if (membersInVc.size >= playerIds.length) {
+                            if (prevPresent === presentIds) continue;
                             if (matchLocks.has(match._id.toString())) continue;
                             matchLocks.add(match._id.toString());
 
@@ -433,8 +499,12 @@ async function start() {
                 }
             }, 3000);
 
-            // Start the 60-second leaderboard updater
+            let leaderboardUpdateRunning = false;
+
+            // Start the 2-minute leaderboard updater
             updateLeaderboard = async () => {
+                if (leaderboardUpdateRunning) return;
+                leaderboardUpdateRunning = true;
                 try {
                     // Wait for MongoDB to be connected
                     if (mongoose.connection.readyState !== 1) return;
@@ -475,7 +545,7 @@ async function start() {
                             .setTitle('🏆 Leaderboard — Top 50 Players')
                             .setColor('#FFD700')
                             .setDescription(embedDescription)
-                            .setFooter({ text: `Updated every 1 minute` })
+                            .setFooter({ text: `Updated every 2 minutes` })
                             .setTimestamp();
  
                         // Use a guild-specific message ID if possible, or just send/edit
@@ -488,17 +558,19 @@ async function start() {
                         if (targetMsg) {
                             await targetMsg.edit({ embeds: [embed] }).catch(() => {});
                         } else {
-                            await lbChannel.send({ embeds: [embed] }).catch(() => {});
+                            await safeChannelSend(lbChannel, { embeds: [embed] });
                         }
                     }
                 } catch (e) {
                     console.error('>>> [LEADERBOARD] Error:', e.message);
+                } finally {
+                    leaderboardUpdateRunning = false;
                 }
             };
 
 
-            // Run every 60 seconds (first run will wait for MongoDB)
-            setInterval(updateLeaderboard, 60000);
+            // Run every 2 minutes (first run will wait for MongoDB)
+            setInterval(updateLeaderboard, 120000);
 
             // Blacklist cleanup checker
             await checkExpiredBlacklists(client).catch(() => {});
@@ -518,8 +590,10 @@ async function start() {
     });
 
     client.on('messageCreate', async (message) => {
-        // DEBUG: Log every message received to see if the bot is actually seeing content
-        console.log(`>>> [MSG-RECV] From: ${message.author.tag} | Content: "${message.content}"`);
+        // Only log prefix command usage to reduce overhead in busy servers
+        if (message.guildId && !message.author.bot && message.content.startsWith('s!')) {
+            console.log(`>>> [MSG-CMD] ${message.author.tag} used ${message.content}`);
+        }
 
         // Auto-delete cdn.discordapp.com and tenor.com links in queue channels
         if (!message.author.bot && message.guildId) {
@@ -558,7 +632,7 @@ async function start() {
             if (commandName === 'set-permissions' || commandName === 'permissions-info') {
                 if (!isOwnerOrSpecialRole) {
                     console.log(`>>> [MSG-PERM] Permission denied for ${message.author.tag}`);
-                    return message.reply('❌ Only the bot owner or a specific admin role can use this command!');
+                    return safeMessageReply(message, '❌ Only the bot owner or a specific admin role can use this command!');
                 }
             } else if (commandName === 'verify') {
                 // Public command - anyone can verify themselves
@@ -571,7 +645,7 @@ async function start() {
                 
                 if (!hasPermission) {
                     console.log(`>>> [MSG-PERM] Permission denied for ${message.author.tag}`);
-                    return message.reply('❌ You do not have permission to use this command!');
+                    return safeMessageReply(message, '❌ You do not have permission to use this command!');
                 }
             }
 
@@ -580,33 +654,36 @@ async function start() {
                 if (message.member) {
                     const bloxlinkResult = await tryBloxlinkVerify(message.member, message.guild, client);
                     if (bloxlinkResult && bloxlinkResult.success) {
-                        return message.reply(`✅ **Verification successful!** Linked to Roblox account **${bloxlinkResult.robloxUsername}** via Bloxlink.${bloxlinkResult.nicknameResult}`);
+                        return safeMessageReply(message, `✅ **Verification successful!** Linked to Roblox account **${bloxlinkResult.robloxUsername}** via Bloxlink.${bloxlinkResult.nicknameResult}`);
                     }
                 }
 
                 // 2. Failed to verify via Bloxlink
-                return message.reply(`❌ **You are not verified with Bloxlink yet!**\n\n` +
+                return safeMessageReply(message, `❌ **You are not verified with Bloxlink yet!**\n\n` +
                                      `Please visit **https://blox.link/** to link your Roblox account to your Discord account first, then run this command again.`);
             }
             if (commandName === 'stats') {
                 const target = message.mentions.users.first() || message.author;
                 const result = await getStatsEmbed(target, message.guild.id, client);
-                return message.reply(result);
+                return safeMessageReply(message, result);
             }
             if (commandName === 'search') {
                 const target = message.mentions.users.first() || message.author;
-                const lookupMsg = message.reply(`🔍 Searching profile for <@${target.id}>...`);
+                const lookupMsg = await safeMessageReply(message, `🔍 Searching profile for <@${target.id}>...`);
                 const result = await getSearchEmbed(target, message.guild.id, client);
-                return lookupMsg.edit(result).catch(() => {});
+                if (lookupMsg && typeof lookupMsg.edit === 'function') {
+                    return lookupMsg.edit(result).catch(() => {});
+                }
+                return null;
             }
             if (commandName === 'set-permissions') {
                 const roleInput = args[1];
                 if (!roleInput) {
-                    return message.reply('❌ Please specify a role. Usage: `s!set-permissions [role] [commands]`');
+                    return safeMessageReply(message, '❌ Please specify a role. Usage: `s!set-permissions [role] [commands]`');
                 }
                 const commandsStr = args.slice(2).join(' ');
                 if (!commandsStr) {
-                    return message.reply('❌ Please specify commands. Usage: `s!set-permissions [role] [commands]`');
+                    return safeMessageReply(message, '❌ Please specify commands. Usage: `s!set-permissions [role] [commands]`');
                 }
 
                 const processRole = (str) => {
@@ -616,7 +693,7 @@ async function start() {
                 const roleId = processRole(roleInput.trim());
                 const role = await message.guild.roles.fetch(roleId).catch(() => null);
                 if (!role) {
-                    return message.reply(`❌ Role \`${roleId}\` not found in this server.`);
+                    return safeMessageReply(message, `❌ Role \`${roleId}\` not found in this server.`);
                 }
 
                 const commandsArray = commandsStr.split(',')
@@ -625,7 +702,7 @@ async function start() {
 
                 const invalidCmds = commandsArray.filter(c => permissions[c] === undefined);
                 if (invalidCmds.length > 0) {
-                    return message.reply(`❌ The following commands do not exist: \`${invalidCmds.join(', ')}\``);
+                    return safeMessageReply(message, `❌ The following commands do not exist: \`${invalidCmds.join(', ')}\``);
                 }
 
                 for (const cmd of Object.keys(permissions)) {
@@ -640,7 +717,7 @@ async function start() {
                 }
                 await savePermissions(permissions);
 
-                return message.reply(`✅ Permissions updated! <@&${roleId}> now has access to: \`${commandsArray.join(', ') || 'None'}\``);
+                return safeMessageReply(message, `✅ Permissions updated! <@&${roleId}> now has access to: \`${commandsArray.join(', ') || 'None'}\``);
             }
             if (commandName === 'permissions-info') {
 
@@ -658,7 +735,7 @@ async function start() {
                     .setColor('#5865F2')
                     .setTimestamp();
 
-                return message.reply({ embeds: [embed] });
+                return safeMessageReply(message, { embeds: [embed] });
             }
         } else {
             // DM message — handle application answers (works for plain messages AND replies)
@@ -694,8 +771,8 @@ async function start() {
                             { userId: message.author.id, status: 'in_progress' },
                             { currentQuestionIndex: nextIndex, answers }
                         ).catch(() => {});
-                        await message.channel.send(`**Question ${nextIndex + 1} of ${questions.length}:**
-${questions[nextIndex]}`).catch(() => {});
+                        await safeChannelSend(message.channel, `**Question ${nextIndex + 1} of ${questions.length}:**
+${questions[nextIndex]}`);
                     } else {
                         // All questions answered — finalize
                         activeApplications.delete(message.author.id);
@@ -726,10 +803,10 @@ ${questions[nextIndex]}`).catch(() => {});
                                 new ButtonBuilder().setCustomId(`app_review_decline_${message.author.id}_${appType}`).setLabel('Decline').setStyle(ButtonStyle.Danger)
                             );
 
-                            await appChannel.send({ content: '<@1474461121531347165> — New application submitted!', embeds: [embed], components: [row] });
+                            await safeChannelSend(appChannel, { content: '<@1474461121531347165> — New application submitted!', embeds: [embed], components: [row] });
                         }
 
-                        await message.channel.send('✅ Thank you! Your application has been submitted and is awaiting review.').catch(() => {});
+                        await safeChannelSend(message.channel, '✅ Thank you! Your application has been submitted and is awaiting review.');
                     }
                 }
             }
@@ -757,9 +834,14 @@ ${questions[nextIndex]}`).catch(() => {});
                     if (joinMatch.loungeChannelId) {
                         const lounge = await newState.guild.channels.fetch(joinMatch.loungeChannelId).catch(() => null);
                         if (lounge) {
-                            await lounge.permissionOverwrites.edit(newState.member, {
-                                ViewChannel: true, SendMessages: true, ReadMessageHistory: true
-                            }).catch(() => {});
+                            const perms = {
+                                ViewChannel: true,
+                                ReadMessageHistory: true
+                            };
+                            if (newState.channelId === joinMatch.teamAVcId || newState.channelId === joinMatch.teamBVcId) {
+                                perms.SendMessages = true;
+                            }
+                            await lounge.permissionOverwrites.edit(newState.member, perms).catch(() => {});
                         }
                     }
 
@@ -808,32 +890,58 @@ ${questions[nextIndex]}`).catch(() => {});
                     );
 
                     if (!stayedInMatch) {
-                        // Hide lounge channel from the player
-                        if (activeMatch.loungeChannelId) {
-                            const lounge = await oldState.guild.channels.fetch(activeMatch.loungeChannelId).catch(() => null);
-                            if (lounge) {
-                                await lounge.permissionOverwrites.edit(oldState.member, {
-                                    ViewChannel: false
-                                }).catch(() => {});
+                        if (activeMatch.status === 'finished') {
+                            // Hide lounge channel from the player after the match is over
+                            if (activeMatch.loungeChannelId) {
+                                const lounge = await oldState.guild.channels.fetch(activeMatch.loungeChannelId).catch(() => null);
+                                if (lounge) {
+                                    await lounge.permissionOverwrites.edit(oldState.member, {
+                                        ViewChannel: false
+                                    }).catch(() => {});
+                                }
                             }
-                        }
 
-                        // Hide Pre-Match VC from the player
-                        if (activeMatch.playersVcId) {
-                            const preVc = await oldState.guild.channels.fetch(activeMatch.playersVcId).catch(() => null);
-                            if (preVc) {
-                                await preVc.permissionOverwrites.edit(oldState.member, {
-                                    ViewChannel: false
-                                }).catch(() => {});
+                            // Hide Pre-Match VC from the player after the match is over
+                            if (activeMatch.playersVcId) {
+                                const preVc = await oldState.guild.channels.fetch(activeMatch.playersVcId).catch(() => null);
+                                if (preVc) {
+                                    await preVc.permissionOverwrites.edit(oldState.member, {
+                                        ViewChannel: false
+                                    }).catch(() => {});
+                                }
                             }
-                        }
 
-                        // Remove queue role from the player
-                        if (activeMatch.roleId) {
-                            const role = await oldState.guild.roles.fetch(activeMatch.roleId).catch(() => null);
-                            if (role) {
-                                await oldState.member.roles.remove(role).catch(() => {});
+                            // Remove queue role from the player after the match is over
+                            if (activeMatch.roleId) {
+                                const role = await oldState.guild.roles.fetch(activeMatch.roleId).catch(() => null);
+                                if (role) {
+                                    await oldState.member.roles.remove(role).catch(() => {});
+                                }
                             }
+                        } else {
+                            if (activeMatch.loungeChannelId) {
+                                const lounge = await oldState.guild.channels.fetch(activeMatch.loungeChannelId).catch(() => null);
+                                if (lounge) {
+                                    await lounge.permissionOverwrites.edit(oldState.member, {
+                                        ViewChannel: null,
+                                        SendMessages: null,
+                                        ReadMessageHistory: null
+                                    }).catch(() => {});
+                                }
+                            }
+
+                            if (activeMatch.playersVcId) {
+                                const preVc = await oldState.guild.channels.fetch(activeMatch.playersVcId).catch(() => null);
+                                if (preVc) {
+                                    await preVc.permissionOverwrites.edit(oldState.member, {
+                                        ViewChannel: null,
+                                        Connect: null,
+                                        Speak: null
+                                    }).catch(() => {});
+                                }
+                            }
+
+                            console.log(`>>> [VOICE] Player ${oldState.member.id} left active match VC; preserving queue access for rejoin.`);
                         }
 
                         // Check if category still exists (match not ended by admin)
@@ -841,7 +949,11 @@ ${questions[nextIndex]}`).catch(() => {});
                             ? await oldState.guild.channels.fetch(activeMatch.categoryId).catch(() => null)
                             : null;
 
-                        if (categoryStillExists) {
+                        if (categoryStillExists && activeMatch.status === 'finished') {
+                            if (suppressMidGameLeaveNotify.has(oldState.channelId)) {
+                                console.log(`>>> [VOICE] Suppressing mid-game leave alert for channel ${oldState.channelId} due to admin match end.`);
+                                return;
+                            }
                             const allPlayers = [
                                 ...(activeMatch.remainingPlayers ? activeMatch.remainingPlayers.split(',') : []),
                                 ...(activeMatch.pickedPlayers ? activeMatch.pickedPlayers.split(',') : []),
@@ -890,7 +1002,7 @@ ${questions[nextIndex]}`).catch(() => {});
             const isDmAppButton = !interaction.guildId && interaction.isButton && interaction.isButton() && interaction.customId && (interaction.customId.startsWith('app_start_') || interaction.customId.startsWith('app_decline_'));
             if (!isDmAppButton && (!interaction.guildId || !ALLOWED_GUILDS.includes(interaction.guildId))) {
                 if (interaction.isRepliable()) {
-                    await interaction.reply({ content: '❌ This bot is not authorized to run on this server.', ephemeral: true }).catch(() => {});
+                    await safeInteractionReply(interaction, { content: '❌ This bot is not authorized to run on this server.', ephemeral: true }).catch(() => {});
                 }
                 return;
             }
@@ -910,8 +1022,8 @@ ${questions[nextIndex]}`).catch(() => {});
                 const guildId = parts[4] || null;
                 const targetUser = await client.users.fetch(targetUserId).catch(() => null);
 
-                if (!targetUser) return interaction.reply({ content: '❌ User not found.', ephemeral: true });
-                if (interaction.user.id !== targetUserId) return interaction.reply({ content: '❌ You can only accept your own application.', ephemeral: true });
+                if (!targetUser) return safeInteractionReply(interaction, { content: '❌ User not found.', ephemeral: true });
+                if (interaction.user.id !== targetUserId) return safeInteractionReply(interaction, { content: '❌ You can only accept your own application.', ephemeral: true });
 
                 try {
                     const questions = APP_DATA[appType].questions;
@@ -923,14 +1035,14 @@ ${questions[nextIndex]}`).catch(() => {});
                     // Also keep in-memory for fast lookups
                     activeApplications.set(targetUserId, { appType, currentQuestionIndex: 0, answers: [], guildId });
 
-                    await targetUser.send(`### 📝 ${appType} Application
+                    await safeUserSend(targetUser, `### 📝 ${appType} Application
 **Question 1 of ${questions.length}:**
 ${questions[0]}`);
                     await interaction.update({ content: '✅ Application started in your DMs!', components: [] }).catch(() => {});
                 } catch (err) {
                     console.error('>>> [ERROR] Failed to start application in DM:', err.message);
                     activeApplications.delete(targetUserId);
-                    return interaction.reply({ content: '❌ Failed to start application in DM.', ephemeral: true });
+                    return safeInteractionReply(interaction, { content: '❌ Failed to start application in DM.', ephemeral: true });
                 }
                 return;
             }
@@ -940,7 +1052,7 @@ ${questions[0]}`);
                 const targetUser = await client.users.fetch(targetUserId).catch(() => null);
 
                 if (targetUser) {
-                    await targetUser.send('❌ Your application request has been declined.').catch(() => {});
+                    await safeUserSend(targetUser, '❌ Your application request has been declined.').catch(() => {});
                 }
                 return interaction.update({ content: '✅ Application declined.', components: [] }).catch(() => {});
             }
@@ -951,13 +1063,13 @@ ${questions[0]}`);
                 const guild = interaction.guild;
                 const reviewer = interaction.member;
                 if (interaction.user.id !== '1474461121531347165') {
-                    return interaction.reply({ content: '❌ You do not have permission to review applications.', ephemeral: true });
+                    return safeInteractionReply(interaction, { content: '❌ You do not have permission to review applications.', ephemeral: true });
                 }
                 const member = await guild.members.fetch(userId).catch(() => null);
 
                 if (action === 'accept') {
                     const app = await Application.findOne({ userId, guildId: guild.id, status: 'pending' });
-                    if (!app) return interaction.reply({ content: '❌ No pending application found.', ephemeral: true });
+                    if (!app) return safeInteractionReply(interaction, { content: '❌ No pending application found.', ephemeral: true });
 
                     // Assign role
                     const roleId = APP_DATA[appType].roleId;
@@ -969,17 +1081,17 @@ ${questions[0]}`);
 
                     const acceptEmbed = EmbedBuilder.from(interaction.message.embeds[0]).setColor('#00FF00');
                     await interaction.update({ content: `✅ Application for <@${userId}> (${appType}) has been **ACCEPTED**. Reviewed by <@${interaction.user.id}>.`, embeds: [acceptEmbed], components: [] }).catch(() => {});
-                    if (member) await member.send(`🎉 Congratulations! Your **${appType}** application has been **ACCEPTED**!`).catch(() => {});
+                    if (member) await safeUserSend(member.user, `🎉 Congratulations! Your **${appType}** application has been **ACCEPTED**!`).catch(() => {});
                 } else {
                     const app = await Application.findOne({ userId, guildId: guild.id, status: 'pending' });
-                    if (!app) return interaction.reply({ content: '❌ No pending application found.', ephemeral: true });
+                    if (!app) return safeInteractionReply(interaction, { content: '❌ No pending application found.', ephemeral: true });
 
                     app.status = 'declined';
                     await app.save();
 
                     const declineEmbed = EmbedBuilder.from(interaction.message.embeds[0]).setColor('#FF0000');
                     await interaction.update({ content: `❌ Application for <@${userId}> (${appType}) has been **DECLINED**. Reviewed by <@${interaction.user.id}>.`, embeds: [declineEmbed], components: [] }).catch(() => {});
-                    if (member) await member.send(`❌ Your **${appType}** application has been **DECLINED**.`).catch(() => {});
+                    if (member) await safeUserSend(member.user, `❌ Your **${appType}** application has been **DECLINED**.`).catch(() => {});
                 }
                 return;
             }
@@ -988,7 +1100,7 @@ ${questions[0]}`);
             if (interaction.customId && interaction.customId.startsWith('appeal_blacklist_')) {
                 const targetUserId = interaction.customId.replace('appeal_blacklist_', '');
                 if (interaction.user.id !== targetUserId) {
-                    return interaction.reply({ content: '❌ You cannot appeal this blacklist, it is not yours!', ephemeral: true }).catch(() => {});
+                    return safeInteractionReply(interaction, { content: '❌ You cannot appeal this blacklist, it is not yours!', ephemeral: true }).catch(() => {});
                 }
 
                 // Find tickets channel
@@ -999,7 +1111,7 @@ ${questions[0]}`);
                 }
 
                 if (!ticketsChannel) {
-                    return interaction.reply({ content: '❌ Tickets channel not found. Please contact an admin!', ephemeral: true }).catch(() => {});
+                    return safeInteractionReply(interaction, { content: '❌ Tickets channel not found. Please contact an admin!', ephemeral: true }).catch(() => {});
                 }
 
                 // Send the @ping message in tickets channel
@@ -1010,7 +1122,7 @@ ${questions[0]}`);
                     }, 5000);
                 }
 
-                await interaction.reply({ content: `✅ Go to <#${ticketsChannel.id}> to open a ticket to appeal.`, ephemeral: true }).catch(() => {});
+                await safeInteractionReply(interaction, { content: `✅ Go to <#${ticketsChannel.id}> to open a ticket to appeal.`, ephemeral: true }).catch(() => {});
                 return;
             }
 
@@ -1018,14 +1130,14 @@ ${questions[0]}`);
             if (interaction.isButton() && interaction.customId.startsWith('vote_mvp_start_')) {
                 const matchId = interaction.customId.replace('vote_mvp_start_', '');
                 const match = await Match.findById(matchId);
-                if (!match) return interaction.reply({ content: '❌ Match not found.', ephemeral: true });
+                if (!match) return safeInteractionReply(interaction, { content: '❌ Match not found.', ephemeral: true });
 
                 const teamA = match.teamA ? match.teamA.split(',') : [];
                 const teamB = match.teamB ? match.teamB.split(',') : [];
                 const playerIds = [...teamA, ...teamB];
 
                 if (!playerIds.includes(interaction.user.id)) {
-                    return interaction.reply({ content: '❌ You are not a player in this match!', ephemeral: true });
+                    return safeInteractionReply(interaction, { content: '❌ You are not a player in this match!', ephemeral: true });
                 }
 
                 const selectOptions = [];
@@ -1044,7 +1156,7 @@ ${questions[0]}`);
                     .addOptions(selectOptions);
 
                 const row = new ActionRowBuilder().addComponents(selectMenu);
-                return interaction.reply({ content: '🌟 Who was the MVP of this scrim match?', components: [row], ephemeral: true });
+                return safeInteractionReply(interaction, { content: '🌟 Who was the MVP of this scrim match?', components: [row], ephemeral: true });
             }
 
             if (interaction.isStringSelectMenu() && interaction.customId.startsWith('vote_mvp_submit_')) {
@@ -1072,13 +1184,13 @@ ${questions[0]}`);
                     const isAllowedUser = user.id === '1479214179146535096';
                     const isAllowedRole = member?.roles.cache.has('1503745954627584172');
                     if (!isAllowedUser && !isAllowedRole) {
-                        return interaction.reply({ content: '❌ Only the bot owner or a specific admin role can use this command!', ephemeral: true });
+                        return safeInteractionReply(interaction, { content: '❌ Only the bot owner or a specific admin role can use this command!', ephemeral: true });
                     }
                 } else if (commandName === 'verify') {
                     // Public command - anyone can verify themselves
                 } else if (commandName === 'send-apps') {
                     if (!isOwnerOrSpecialRole && !ALLOWED_APP_COMMAND_ROLES.some(roleId => member?.roles.cache.has(roleId))) {
-                        return interaction.reply({ content: '❌ You do not have permission to use this command!', ephemeral: true });
+                        return safeInteractionReply(interaction, { content: '❌ You do not have permission to use this command!', ephemeral: true });
                     }
 
                     const user = options.getUser('user');
@@ -1096,30 +1208,30 @@ ${questions[0]}`);
                             new ButtonBuilder().setCustomId(`app_decline_${user.id}`).setLabel('No, thanks.').setStyle(ButtonStyle.Danger)
                         );
 
-                        await user.send({ embeds: [embed], components: [row] });
-                        return interaction.reply({ content: `✅ Application request sent to <@${user.id}> in DMs.`, ephemeral: true });
+                        await safeUserSend(user, { embeds: [embed], components: [row] });
+                        return safeInteractionReply(interaction, { content: `✅ Application request sent to <@${user.id}> in DMs.`, ephemeral: true });
                     } catch (err) {
                         console.error('>>> [ERROR] Failed to send DM for app request:', err.message);
-                        return interaction.reply({ content: `❌ Could not send DM to <@${user.id}>. Their DMs might be closed.`, ephemeral: true });
+                        return safeInteractionReply(interaction, { content: `❌ Could not send DM to <@${user.id}>. Their DMs might be closed.`, ephemeral: true });
                     }
                 } else if (commandName === 'dm') {
-                    if (!isOwnerOrSpecialRole) return interaction.reply({ content: '❌ You do not have permission to use this command.', ephemeral: true });
+                    if (!isOwnerOrSpecialRole) return safeInteractionReply(interaction, { content: '❌ You do not have permission to use this command.', ephemeral: true });
                     const target = options.getUser('user');
                     const msg = options.getString('message');
                     try {
-                        await target.send(msg);
-                        return interaction.reply({ content: `✅ DM sent to <@${target.id}>.`, ephemeral: true });
+                        await safeUserSend(target, msg);
+                        return safeInteractionReply(interaction, { content: `✅ DM sent to <@${target.id}>.`, ephemeral: true });
                     } catch (err) {
-                        return interaction.reply({ content: `❌ Could not DM <@${target.id}>. Their DMs may be closed.`, ephemeral: true });
+                        return safeInteractionReply(interaction, { content: `❌ Could not DM <@${target.id}>. Their DMs may be closed.`, ephemeral: true });
                     }
                 } else if (commandName === 'apply') {
                     // Public self-apply command
                     const appType = options.getString('position');
-                    if (!APP_DATA[appType]) return interaction.reply({ content: '❌ Invalid position.', ephemeral: true });
+                    if (!APP_DATA[appType]) return safeInteractionReply(interaction, { content: '❌ Invalid position.', ephemeral: true });
 
                     // Check if already has an in-progress application
                     const existing = await Application.findOne({ userId: user.id, status: 'in_progress' }).catch(() => null);
-                    if (existing) return interaction.reply({ content: '❌ You already have an application in progress. Please check your DMs.', ephemeral: true });
+                    if (existing) return safeInteractionReply(interaction, { content: '❌ You already have an application in progress. Please check your DMs.', ephemeral: true });
 
                     try {
                         const questions = APP_DATA[appType].questions;
@@ -1128,15 +1240,15 @@ ${questions[0]}`);
                         // Keep in-memory too
                         activeApplications.set(user.id, { appType, currentQuestionIndex: 0, answers: [], guildId: guild.id });
                         // Send first question directly
-                        await interaction.user.send(`### 📝 ${appType} Application
+                        await safeUserSend(interaction.user, `### 📝 ${appType} Application
 **Question 1 of ${questions.length}:**
 ${questions[0]}`);
-                        return interaction.reply({ content: '✅ Application started! Check your DMs for the first question.', ephemeral: true });
+                        return safeInteractionReply(interaction, { content: '✅ Application started! Check your DMs for the first question.', ephemeral: true });
                     } catch (err) {
                         console.error('>>> [ERROR] Failed to start self-application:', err.message);
                         await Application.findOneAndDelete({ userId: user.id, status: 'in_progress' }).catch(() => {});
                         activeApplications.delete(user.id);
-                        return interaction.reply({ content: '❌ Could not send you a DM. Please open your DMs and try again.', ephemeral: true });
+                        return safeInteractionReply(interaction, { content: '❌ Could not send you a DM. Please open your DMs and try again.', ephemeral: true });
                     }
                 } else {
                     const requiredRoles = permissions[commandName] || [];
@@ -1148,13 +1260,12 @@ ${questions[0]}`);
                     const hasPermission = hasRole || isOwnerOrSpecialRole || isAdmin;
                     
                     if (!hasPermission) {
-                        return interaction.reply({ content: '❌ You do not have permission to use this command!', ephemeral: true });
+                        return safeInteractionReply(interaction, { content: '❌ You do not have permission to use this command!', ephemeral: true });
                     }
                 }
 
                 if (commandName === 'set-leaderboard') {
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
-                    if (!interaction.deferred && !interaction.replied) return;
+                    await safeInteractionDeferReply(interaction, { ephemeral: true });
 
                     const oldSettings = await GuildSettings.findOne({ guildId: guild.id });
                     const oldChannelId = oldSettings?.leaderboardChannelId;
@@ -1184,11 +1295,10 @@ ${questions[0]}`);
                         }, 1000);
                     }
 
-                    return interaction.editReply({ content: `✅ Leaderboard has been set to ${channel}!` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                    return safeInteractionEditReply(interaction, { content: `✅ Leaderboard has been set to ${channel}!` });
                 }
                 if (commandName === 'set-permissions') {
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
-                    if (!interaction.deferred && !interaction.replied) return;
+                    await safeInteractionDeferReply(interaction, { ephemeral: true });
 
                     const roleInput = options.getString('role');
                     const processRole = (str) => {
@@ -1199,7 +1309,7 @@ ${questions[0]}`);
 
                     const role = await guild.roles.fetch(roleId).catch(() => null);
                     if (!role) {
-                        return interaction.editReply({ content: `❌ Role \`${roleId}\` not found in this server.` });
+                        return safeInteractionEditReply(interaction, { content: `❌ Role \`${roleId}\` not found in this server.` });
                     }
 
                     const commandsInput = options.getString('commands');
@@ -1209,7 +1319,7 @@ ${questions[0]}`);
 
                     const invalidCmds = commandsArray.filter(c => permissions[c] === undefined);
                     if (invalidCmds.length > 0) {
-                        return interaction.editReply({ content: `❌ The following commands do not exist: \`${invalidCmds.join(', ')}\`` });
+                        return safeInteractionEditReply(interaction, { content: `❌ The following commands do not exist: \`${invalidCmds.join(', ')}\`` });
                     }
 
                     for (const cmd of Object.keys(permissions)) {
@@ -1224,11 +1334,10 @@ ${questions[0]}`);
                     }
                     await savePermissions(permissions);
 
-                    return interaction.editReply({ content: `✅ Permissions updated! <@&${roleId}> now has access to: \`${commandsArray.join(', ') || 'None'}\`` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                    return safeInteractionEditReply(interaction, { content: `✅ Permissions updated! <@&${roleId}> now has access to: \`${commandsArray.join(', ') || 'None'}\`` });
                 }
                 if (commandName === 'permissions-info') {
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
-                    if (!interaction.deferred && !interaction.replied) return;
+                    await safeInteractionDeferReply(interaction, { ephemeral: true });
 
                     const lines = [];
                     for (const [cmd, roles] of Object.entries(permissions)) {
@@ -1244,11 +1353,10 @@ ${questions[0]}`);
                         .setColor('#5865F2')
                         .setTimestamp();
 
-                    return interaction.editReply({ embeds: [embed] }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                    return safeInteractionEditReply(interaction, { embeds: [embed] });
                 }
                 if (commandName === 'setup') {
-                    await interaction.deferReply().catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
-                    if (!interaction.deferred && !interaction.replied) return;
+                    await safeInteractionDeferReply(interaction, { ephemeral: true });
 
                     const embed = new EmbedBuilder()
                         .setTitle('🚀 eScrims Bot Setup')
@@ -1259,28 +1367,27 @@ ${questions[0]}`);
                             '**Note:** Ensure the bot has `Administrator` or proper permissions in the target category.')
                         .setColor('#5865F2')
                         .setTimestamp();
-                    return interaction.editReply({ embeds: [embed] }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                    return safeInteractionEditReply(interaction, { embeds: [embed] });
                 }
                 if (commandName === 'verify') {
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
-                    if (!interaction.deferred && !interaction.replied) return;
+                    await safeInteractionDeferReply(interaction, { ephemeral: true });
 
                     // 1. Try Bloxlink verification
                     const bloxlinkResult = await tryBloxlinkVerify(member, guild, client);
                     if (bloxlinkResult && bloxlinkResult.success) {
-                        return interaction.editReply({
+                        return safeInteractionEditReply(interaction, {
                             content: `✅ **Verification successful!** Linked to Roblox account **${bloxlinkResult.robloxUsername}** via Bloxlink.${bloxlinkResult.nicknameResult}`
-                        }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                        });
                     }
 
                     // 2. Failed to verify via Bloxlink
-                    return interaction.editReply({
+                    return safeInteractionEditReply(interaction, {
                         content: `❌ **You are not verified with Bloxlink yet!**\n\n` +
                                  `Please visit **https://blox.link/** to link your Roblox account to your Discord account first, then run this command again.`
                     }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                 }
                 if (commandName === 'queue-enable') {
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const interval = options.getInteger('interval');
@@ -1309,10 +1416,10 @@ ${questions[0]}`);
                     }, interval * 60000);
                     queueIntervals.set(key, timer);
 
-                    return interaction.editReply({ content: `✅ Queue system configured! Messages will be sent in ${channel} every ${interval} minutes.` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                    return safeInteractionEditReply(interaction, { content: `✅ Queue system configured! Messages will be sent in ${channel} every ${interval} minutes.` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                 }
                 if (commandName === 'queue-disable') {
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const key = `${guild.id}_${channel.id}`;
@@ -1334,10 +1441,10 @@ ${questions[0]}`);
                     // Remove the queue config for this channel
                     await QueueConfig.deleteOne({ guildId: guild.id, channelId: channel.id });
 
-                    return interaction.editReply({ content: `✅ Queue has been disabled in ${channel}. No more queue messages will be sent.` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                    return safeInteractionEditReply(interaction, { content: `✅ Queue has been disabled in ${channel}. No more queue messages will be sent.` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                 }
                 if (commandName === 'help') {
-                    await interaction.deferReply().catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction);
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const hasAccess = (cmd) => {
@@ -1398,26 +1505,26 @@ ${questions[0]}`);
                         embed.setDescription('*You do not have permission to view or use any commands.*');
                     }
 
-                    return interaction.editReply({ embeds: [embed] }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                    return safeInteractionEditReply(interaction, { embeds: [embed] }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                 }
                 if (commandName === 'stats') {
-                    await interaction.deferReply().catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction);
                     if (!interaction.deferred && !interaction.replied) return; // Stop if defer failed
 
                     const target = options.getUser('user') || user;
                     const result = await getStatsEmbed(target, guild.id, client);
-                    return interaction.editReply(result).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                    return safeInteractionEditReply(interaction, result).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                 }
                 if (commandName === 'search') {
-                    await interaction.deferReply().catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction);
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const targetUser = options.getUser('user');
                     const result = await getSearchEmbed(targetUser, guild.id, client);
-                    return interaction.editReply(result).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                    return safeInteractionEditReply(interaction, result).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                 }
                 if (commandName === 'go') {
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     await QueueConfig.findOneAndUpdate(
@@ -1430,16 +1537,18 @@ ${questions[0]}`);
                     await ActiveQueuePlayer.deleteMany({ guildId: guild.id, channelId: channel.id });
 
                     await sendQueueMessage(client, guild.id, channel.id, true, true);
-                    return interaction.editReply({ content: '🚀 Queue refreshed in this channel!' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                    return safeInteractionEditReply(interaction, { content: '🚀 Queue refreshed in this channel!' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                 }
                 if (commandName === 'queueend') {
                     const matchId = options.getInteger('number');
                     const match = await Match.findOne({ guildId: guild.id, matchId });
-                    if (!match) return interaction.reply({ content: `❌ Match \`#${matchId}\` not found!`, ephemeral: true });
+                    if (!match) return safeInteractionReply(interaction, { content: `❌ Match \`#${matchId}\` not found!`, ephemeral: true });
 
-                    await interaction.deferReply();
+                    if (!await safeDeferReply(interaction, { ephemeral: true })) return;
 
                     const channelsToDelete = [match.teamAVcId, match.teamBVcId, match.loungeChannelId, match.captainPickChannelId, match.playersVcId].filter(id => id);
+                    channelsToDelete.forEach(id => suppressMidGameLeaveNotify.add(id));
+                    setTimeout(() => channelsToDelete.forEach(id => suppressMidGameLeaveNotify.delete(id)), 30000);
                     for (const id of channelsToDelete) {
                         const ch = await guild.channels.fetch(id).catch(() => null);
                         if (ch) await ch.delete().catch(() => { });
@@ -1461,7 +1570,7 @@ ${questions[0]}`);
 
                     await Match.deleteOne({ _id: match._id });
                     const isStaticCategory = match.categoryId === '1503751701684027474';
-                    return interaction.editReply({ content: `✅ Match \`#${matchId}\` ${isStaticCategory ? 'channels' : 'and its category'} have been deleted.` });
+                    return safeEditReply(interaction, { content: `✅ Match \`#${matchId}\` ${isStaticCategory ? 'channels' : 'and its category'} have been deleted.` });
                 }
                 if (commandName === 'cancel') {
                     const match = await Match.findOne({
@@ -1475,13 +1584,13 @@ ${questions[0]}`);
                         ]
                     });
 
-                    if (!match) return interaction.reply({ content: '❌ This command can only be used inside a match channel!', ephemeral: true });
+                    if (!match) return safeInteractionReply(interaction, { content: '❌ This command can only be used inside a match channel!', ephemeral: true });
 
                     const teamA = match.teamA ? match.teamA.split(',') : [];
                     const teamB = match.teamB ? match.teamB.split(',') : [];
                     const playerIds = [...teamA, ...teamB].filter(id => id.length > 5);
                     if (!playerIds.includes(user.id) && !isAdmin) {
-                        return interaction.reply({ content: '❌ Only players in this match can start a vote!', ephemeral: true });
+                        return safeInteractionReply(interaction, { content: '❌ Only players in this match can start a vote!', ephemeral: true });
                     }
 
                     const votes = new Map();
@@ -1502,7 +1611,7 @@ ${questions[0]}`);
                         return new EmbedBuilder().setTitle('⚠️ End Match Vote').setDescription(desc).setColor(yesCount > noCount ? '#ED4245' : '#5865F2').setTimestamp();
                     };
 
-                    const msg = await interaction.reply({ embeds: [generateStatus()], components: [row], fetchReply: true });
+                    const msg = await safeInteractionReply(interaction, { embeds: [generateStatus()], components: [row], fetchReply: true });
                     const collector = msg.createMessageComponentCollector({ time: 30000 });
 
                     collector.on('collect', async (i) => {
@@ -1520,6 +1629,8 @@ ${questions[0]}`);
                         if (yesCount > noCount) {
                             await channel.send(`🚨 **Vote Passed!** Match #${match.matchId} is being deleted...`);
                             const channelsToDelete = [match.teamAVcId, match.teamBVcId, match.loungeChannelId, match.captainPickChannelId, match.playersVcId].filter(id => id);
+                            channelsToDelete.forEach(id => suppressMidGameLeaveNotify.add(id));
+                            setTimeout(() => channelsToDelete.forEach(id => suppressMidGameLeaveNotify.delete(id)), 30000);
                             for (const id of channelsToDelete) {
                                 const ch = await guild.channels.fetch(id).catch(() => null);
                                 if (ch) await ch.delete().catch(() => { });
@@ -1553,9 +1664,9 @@ ${questions[0]}`);
                         ]
                     });
 
-                    if (!match) return interaction.reply({ content: '❌ This command can only be used inside a match channel!', ephemeral: true });
+                    if (!match) return safeInteractionReply(interaction, { content: '❌ This command can only be used inside a match channel!', ephemeral: true });
 
-                    await interaction.deferReply();
+                    if (!await safeDeferReply(interaction, { ephemeral: true })) return;
                     const embed = new EmbedBuilder()
                         .setTitle(`🏆 Game Result: Match #${match.matchId}`)
                         .setDescription('Which team won the match?\n\n1️⃣ **Team 1**\n*No votes yet*\n\n2️⃣ **Team 2**\n*No votes yet*\n\n*Voting ends in 30 seconds.*')
@@ -1567,7 +1678,8 @@ ${questions[0]}`);
                         new ButtonBuilder().setCustomId('win_team2').setLabel('Team 2 Won').setStyle(ButtonStyle.Danger)
                     );
 
-                    const msg = await interaction.editReply({ embeds: [embed], components: [row] });
+                    const msg = await safeEditReply(interaction, { embeds: [embed], components: [row] });
+                    if (!msg) return;
                     const votes = new Map();
                     const collector = msg.createMessageComponentCollector({ time: 30000 });
 
@@ -1712,46 +1824,46 @@ ${questions[0]}`);
                 }
                 if (commandName === 'ping') {
                     const start = Date.now();
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const latency = Date.now() - start;
-                    return interaction.editReply({ content: `🏓 **Pong!**\nGateway: \`${client.ws.ping}ms\`\nREST: \`${latency}ms\`` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                    return safeInteractionEditReply(interaction, { content: `🏓 **Pong!**\nGateway: \`${client.ws.ping}ms\`\nREST: \`${latency}ms\`` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                 }
                 if (commandName === 'givepoints') {
-                    await interaction.deferReply().catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction);
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const target = options.getUser('user');
                     const amount = options.getInteger('amount');
-                    if (amount <= 0) return interaction.editReply({ content: '❌ Amount must be a positive number!' });
+                    if (amount <= 0) return safeInteractionEditReply(interaction, { content: '❌ Amount must be a positive number!' });
 
                     let data = await updateUserPoints(target.id, 'shared_scrims', amount);
 
                     await PointHistory.create({ userId: target.id, guildId: 'shared_scrims', points: amount, type: 'admin_give' });
 
-                    return interaction.editReply({ content: `✅ Gave **${amount}** points to <@${target.id}>. They now have **${data.points.toFixed(1)}** points.` });
+                    return safeInteractionEditReply(interaction, { content: `✅ Gave **${amount}** points to <@${target.id}>. They now have **${data.points.toFixed(1)}** points.` });
                 }
                 if (commandName === 'removepoints') {
-                    await interaction.deferReply().catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction);
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const target = options.getUser('user');
                     const amount = options.getInteger('amount');
-                    if (amount <= 0) return interaction.editReply({ content: '❌ Amount must be a positive number!' });
+                    if (amount <= 0) return safeInteractionEditReply(interaction, { content: '❌ Amount must be a positive number!' });
 
                     let data = await updateUserPoints(target.id, 'shared_scrims', -amount);
 
                     await PointHistory.create({ userId: target.id, guildId: 'shared_scrims', points: -amount, type: 'admin_remove' });
 
-                    return interaction.editReply({ content: `✅ Removed **${amount}** points from <@${target.id}>. They now have **${data.points.toFixed(1)}** points.` });
+                    return safeInteractionEditReply(interaction, { content: `✅ Removed **${amount}** points from <@${target.id}>. They now have **${data.points.toFixed(1)}** points.` });
                 }
                 if (commandName === 'ppq') {
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const playersCount = options.getInteger('players');
-                    if (playersCount <= 0) return interaction.editReply({ content: '❌ Number of players must be a positive number!' });
+                    if (playersCount <= 0) return safeInteractionEditReply(interaction, { content: '❌ Number of players must be a positive number!' });
 
                     await QueueConfig.findOneAndUpdate(
                         { guildId: guild.id, channelId: channel.id },
@@ -1761,10 +1873,10 @@ ${questions[0]}`);
 
                     await sendQueueMessage(client, guild.id, channel.id, false);
 
-                    return interaction.editReply({ content: `✅ Required players for queue in this channel set to **${playersCount}**.` });
+                    return safeInteractionEditReply(interaction, { content: `✅ Required players for queue in this channel set to **${playersCount}**.` });
                 }
                 if (commandName === 'startqueue') {
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const forcedMatchId = options.getInteger('queuenumber');
@@ -1772,7 +1884,7 @@ ${questions[0]}`);
                     // Find players in the current queue
                     const players = await ActiveQueuePlayer.find({ guildId: guild.id, channelId: channel.id });
                     if (players.length === 0) {
-                        return interaction.editReply({ content: '❌ There are no players currently in the queue to start a match!' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                        return safeInteractionEditReply(interaction, { content: '❌ There are no players currently in the queue to start a match!' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                     }
 
                     // Get or create guild settings
@@ -1806,35 +1918,35 @@ ${questions[0]}`);
                             await QueueConfig.updateOne({ guildId: guild.id, channelId: channel.id }, { lastMessageId: null });
                         }
 
-                        return interaction.editReply({ content: `✅ Match **#${forcedMatchId}** successfully force-started with **${players.length}** players!` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                        return safeInteractionEditReply(interaction, { content: `✅ Match **#${forcedMatchId}** successfully force-started with **${players.length}** players!` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                     } catch (err) {
                         console.error('>>> [ERROR] Force Match startup failed:', err);
-                        return interaction.editReply({ content: '❌ Failed to create match channels. Please check bot permissions!' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                        return safeInteractionEditReply(interaction, { content: '❌ Failed to create match channels. Please check bot permissions!' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                     }
                 }
                 if (commandName === 'renew_queue_players') {
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const matchId = options.getInteger('queuenumber');
                     const match = await Match.findOne({ guildId: guild.id, matchId });
                     if (!match) {
-                        return interaction.editReply({ content: `❌ Match **#${matchId}** not found!` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                        return safeInteractionEditReply(interaction, { content: `❌ Match **#${matchId}** not found!` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                     }
 
                     if (match.status !== 'pre_vc') {
-                        return interaction.editReply({ content: `❌ Match **#${matchId}** has already started or finished (Status: \`${match.status}\`).` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                        return safeInteractionEditReply(interaction, { content: `❌ Match **#${matchId}** has already started or finished (Status: \`${match.status}\`).` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                     }
 
                     const vc = await guild.channels.fetch(match.playersVcId).catch(() => null);
                     if (!vc) {
-                        return interaction.editReply({ content: '❌ Pre-match Voice Channel not found!' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                        return safeInteractionEditReply(interaction, { content: '❌ Pre-match Voice Channel not found!' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                     }
 
                     // Get all member IDs in the VC
                     const memberIdsInVc = vc.members.map(m => m.id);
                     if (memberIdsInVc.length === 0) {
-                        return interaction.editReply({ content: '❌ No players are currently inside the pre-match Voice Channel!' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                        return safeInteractionEditReply(interaction, { content: '❌ No players are currently inside the pre-match Voice Channel!' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                     }
 
                     try {
@@ -1872,14 +1984,14 @@ ${questions[0]}`);
                         lastVcPlayers.delete(lastKey);
 
                         // Trigger immediate check so VC checker runs and launches match pick phase instantly
-                        return interaction.editReply({ content: `✅ Match **#${matchId}** players updated to match the Voice Channel! Updated count: **${memberIdsInVc.length}** players. The match will now transition automatically.` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                        return safeInteractionEditReply(interaction, { content: `✅ Match **#${matchId}** players updated to match the Voice Channel! Updated count: **${memberIdsInVc.length}** players. The match will now transition automatically.` }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                     } catch (err) {
                         console.error('>>> [ERROR] renew_queue_players failed:', err);
-                        return interaction.editReply({ content: '❌ Failed to renew players. Please check bot role permissions.' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                        return safeInteractionEditReply(interaction, { content: '❌ Failed to renew players. Please check bot role permissions.' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                     }
                 }
                 if (commandName === 'blacklist') {
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const targetUser = options.getUser('user');
@@ -1887,7 +1999,7 @@ ${questions[0]}`);
                     const match = durationStr.match(/^(\d+)([smhdw])$/i);
 
                     if (!match) {
-                        return interaction.editReply({ content: '❌ Invalid duration format! Use e.g. `30m`, `12h`, `1d`, `2w`.' }).catch(() => {});
+                        return safeInteractionEditReply(interaction, { content: '❌ Invalid duration format! Use e.g. `30m`, `12h`, `1d`, `2w`.' }).catch(() => {});
                     }
 
                     const amount = parseInt(match[1], 10);
@@ -1905,14 +2017,14 @@ ${questions[0]}`);
                     try {
                         const targetMember = await guild.members.fetch(targetUser.id).catch(() => null);
                         if (!targetMember) {
-                            return interaction.editReply({ content: '❌ User not found in this guild!' }).catch(() => {});
+                            return safeInteractionEditReply(interaction, { content: '❌ User not found in this guild!' }).catch(() => {});
                         }
 
                         // Give the blacklist role
                         const roleId = '1503814587877949632';
                         const blacklistRole = await guild.roles.fetch(roleId).catch(() => null);
                         if (!blacklistRole) {
-                            return interaction.editReply({ content: `❌ Blacklist role with ID \`${roleId}\` not found in this guild! Please create/configure it.` }).catch(() => {});
+                            return safeInteractionEditReply(interaction, { content: `❌ Blacklist role with ID \`${roleId}\` not found in this guild! Please create/configure it.` }).catch(() => {});
                         }
 
                         await targetMember.roles.add(blacklistRole).catch(err => {
@@ -1945,20 +2057,20 @@ ${questions[0]}`);
                             }
                         }
 
-                        return interaction.editReply({ content: `✅ Successfully blacklisted **${targetUser.tag}** for **${durationStr}** (expires at <t:${Math.floor(expiresAt.getTime() / 1000)}:F>).` }).catch(() => {});
+                        return safeInteractionEditReply(interaction, { content: `✅ Successfully blacklisted **${targetUser.tag}** for **${durationStr}** (expires at <t:${Math.floor(expiresAt.getTime() / 1000)}:F>).` }).catch(() => {});
                     } catch (err) {
                         console.error('>>> [ERROR] Blacklist command failed:', err);
-                        return interaction.editReply({ content: '❌ An error occurred while blacklisting the user.' }).catch(() => {});
+                        return safeInteractionEditReply(interaction, { content: '❌ An error occurred while blacklisting the user.' }).catch(() => {});
                     }
                 }
                 if (commandName === 'substitute') {
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     // Find which queue channel the user is in
                     const playerEntry = await ActiveQueuePlayer.findOne({ guildId: guild.id, userId: user.id });
                     if (!playerEntry) {
-                        return interaction.editReply({ content: '❌ You are not currently in any queue!' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                        return safeInteractionEditReply(interaction, { content: '❌ You are not currently in any queue!' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                     }
 
                     const queueChannelId = playerEntry.channelId;
@@ -1988,25 +2100,25 @@ ${questions[0]}`);
                     // Send the sub request to the same channel the command was used in
                     await channel.send({ content: '@here', embeds: [subEmbed], components: [subRow] }).catch(err => console.error('>>> [ERROR] Failed to send sub message:', err.message));
 
-                    return interaction.editReply({ content: '✅ You have been removed from the queue and a substitution request has been posted.' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
+                    return safeInteractionEditReply(interaction, { content: '✅ You have been removed from the queue and a substitution request has been posted.' }).catch(err => console.error('>>> [ERROR] Edit failed:', err.message));
                 }
                 if (commandName === 'substitutes') {
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const activeMatch = await Match.findOne({ guildId: guild.id, status: 'pre_vc' });
                     if (!activeMatch) {
-                        return interaction.editReply({ content: '❌ No active pre-vc matches found in this guild.' }).catch(() => {});
+                        return safeInteractionEditReply(interaction, { content: '❌ No active pre-vc matches found in this guild.' }).catch(() => {});
                     }
 
                     await checkAndSendSubstitutionAlert(client, activeMatch, true).catch(err => {
                         console.error(`>>> [SUB-CMD-ERR] checkAndSendSubstitutionAlert failed:`, err.message);
                     });
 
-                    return interaction.editReply({ content: `✅ Manual substitution check triggered for Match #${activeMatch.matchId}. Alerts have been sent to the replacements channel if players are missing.` }).catch(() => {});
+                    return safeInteractionEditReply(interaction, { content: `✅ Manual substitution check triggered for Match #${activeMatch.matchId}. Alerts have been sent to the replacements channel if players are missing.` }).catch(() => {});
                 }
                 if (commandName === 'swap') {
-                    await interaction.deferReply({ ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
+                    await safeInteractionDeferReply(interaction, { ephemeral: true }).catch(err => console.error('>>> [ERROR] Defer failed:', err.message));
                     if (!interaction.deferred && !interaction.replied) return;
 
                     const player1 = options.getUser('player1');
@@ -2024,7 +2136,7 @@ ${questions[0]}`);
                     });
 
                     if (!match) {
-                        return interaction.editReply({ content: `❌ Player <@${player1.id}> is not in any active match!` }).catch(() => {});
+                        return safeInteractionEditReply(interaction, { content: `❌ Player <@${player1.id}> is not in any active match!` }).catch(() => {});
                     }
 
                     // Check if player2 is already in this match
@@ -2032,7 +2144,7 @@ ${questions[0]}`);
                         (match.teamA && match.teamA.includes(player2.id)) ||
                         (match.teamB && match.teamB.includes(player2.id));
                     if (isPlayer2InMatch) {
-                        return interaction.editReply({ content: `❌ Player <@${player2.id}> is already in this match!` }).catch(() => {});
+                        return safeInteractionEditReply(interaction, { content: `❌ Player <@${player2.id}> is already in this match!` }).catch(() => {});
                     }
 
                     // Check if player2 is blacklisted
@@ -2040,7 +2152,7 @@ ${questions[0]}`);
                     const player2Member = await guild.members.fetch(player2.id).catch(() => null);
                     const hasBlacklistRole = player2Member?.roles.cache.has('1503814587877949632');
                     if (hasBlacklistRole || (isBlacklisted && isBlacklisted.expiresAt > new Date())) {
-                        return interaction.editReply({ content: `❌ Player <@${player2.id}> is blacklisted and cannot join!` }).catch(() => {});
+                        return safeInteractionEditReply(interaction, { content: `❌ Player <@${player2.id}> is blacklisted and cannot join!` }).catch(() => {});
                     }
 
                     try {
@@ -2084,15 +2196,15 @@ ${questions[0]}`);
                             await loungeChannel.send({ content: messageContent }).catch(() => {});
                         }
 
-                        return interaction.editReply({ content: `✅ Successfully swapped <@${player1.id}> with <@${player2.id}>. ${messageContent}` }).catch(() => {});
+                        return safeInteractionEditReply(interaction, { content: `✅ Successfully swapped <@${player1.id}> with <@${player2.id}>. ${messageContent}` }).catch(() => {});
                     } catch (err) {
                         console.error('>>> [ERROR] /swap failed:', err);
-                        return interaction.editReply({ content: '❌ An error occurred while swapping players.' }).catch(() => {});
+                        return safeInteractionEditReply(interaction, { content: '❌ An error occurred while swapping players.' }).catch(() => {});
                     }
                 }
                 if (commandName === 'refresh') {
                     if (user.id !== '1479214179146535096') {
-                        return interaction.reply({ content: '❌ You do not have permission to use this owner-only command.', ephemeral: true });
+                        return safeInteractionReply(interaction, { content: '❌ You do not have permission to use this owner-only command.', ephemeral: true });
                     }
 
                     const row = new ActionRowBuilder().addComponents(
@@ -2100,7 +2212,7 @@ ${questions[0]}`);
                         new ButtonBuilder().setCustomId('refresh_cancel').setLabel('No, Cancel').setStyle(ButtonStyle.Danger)
                     );
 
-                    const response = await interaction.reply({
+                    const response = await safeInteractionReply(interaction, {
                         content: '⚠️ **Are you sure you want to perform a hard reset?** This will fully wipe all player stats (MMR back to 1000), point history logs, active queue players, queue counters, and running matches!',
                         components: [row],
                         ephemeral: true
@@ -2129,7 +2241,7 @@ ${questions[0]}`);
                             // 5. Clean up any active matches that are running
                             await Match.deleteMany({});
 
-                            await interaction.editReply({
+                            await safeInteractionEditReply(interaction, {
                                 content: '✅ **Bot Refresh Complete!** All queue players, player stats (MMR back to 1000), point history logs, queue counters, and active matches have been fully reset.',
                                 components: []
                             });
@@ -2140,7 +2252,7 @@ ${questions[0]}`);
                             });
                         }
                     } catch (e) {
-                        await interaction.editReply({ content: '⏳ **Confirmation Timeout.** No changes were made.', components: [] }).catch(() => {});
+                        await safeInteractionEditReply(interaction, { content: '⏳ **Confirmation Timeout.** No changes were made.', components: [] }).catch(() => {});
                     }
                 }
             }
@@ -2156,11 +2268,11 @@ ${questions[0]}`);
 
             try {
                 if (!interaction.replied && !interaction.deferred) {
-                    await interaction.reply({ content: '❌ An internal error occurred while processing this command.', ephemeral: true }).catch(() => { });
+                    await safeInteractionReply(interaction, { content: '❌ An internal error occurred while processing this command.', ephemeral: true }).catch(() => { });
                 } else if (interaction.deferred) {
-                    await interaction.editReply({ content: '❌ An error occurred while executing this command.' }).catch(() => { });
+                    await safeInteractionEditReply(interaction, { content: '❌ An error occurred while executing this command.' }).catch(() => { });
                 } else {
-                    await interaction.followUp({ content: '❌ An error occurred while executing this command.', ephemeral: true }).catch(() => { });
+                    await safeInteractionFollowUp(interaction, { content: '❌ An error occurred while executing this command.', ephemeral: true }).catch(() => { });
                 }
             } catch (secondaryErr) {
                 console.error('>>> [CRITICAL] Failed to send error message to user:', secondaryErr.message);
@@ -2192,6 +2304,16 @@ ${questions[0]}`);
             await client.login(TOKEN);
             clearTimeout(connectionTimeout);
             console.log(">>> [BOOT] ✅ Discord login successful!");
+            
+            // === KEEP-ALIVE: Prevent HuggingFace Spaces suspension on free tier ===
+            const http = require('http');
+            setInterval(() => {
+                http.get('http://localhost:7860/health', (res) => {
+                    console.log(`>>> [PING] Health check: ${res.statusCode}`);
+                }).on('error', (e) => console.error('>>> [PING ERROR]', e.message));
+            }, 300000); // Ping every 5 minutes
+            console.log(">>> [BOOT] ✅ Keep-alive ping enabled (5 min interval)");
+            
             break;
         } catch (err) {
             loginAttempts++;
