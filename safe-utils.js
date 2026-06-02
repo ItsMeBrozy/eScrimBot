@@ -180,6 +180,56 @@ async function safeMessageEdit(message, response) {
     }
 }
 
+// Retry wrapper with exponential backoff for transient network errors
+async function safeDeferWithRetry(interaction, options = {}, maxRetries = 3) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            if (!interaction || typeof interaction.deferReply !== 'function') return false;
+            if (interaction.replied || interaction.deferred || (typeof interaction.isAcknowledged === 'function' && interaction.isAcknowledged())) return true;
+            
+            await interaction.deferReply(options);
+            return true;
+        } catch (err) {
+            const isTransient = err.name === 'AbortError' || 
+                                err.code === 'UND_ERR_CONNECT_TIMEOUT' || 
+                                err.message?.includes('Connect Timeout') ||
+                                err.message?.includes('timeout');
+            
+            if (!isTransient || attempt === maxRetries - 1) {
+                console.error(`>>> [ERROR] Defer failed after ${attempt + 1} attempt(s):`, err.message);
+                return false;
+            }
+            
+            const backoffMs = 1000 * Math.pow(2, attempt); // exponential: 1s, 2s, 4s
+            console.warn(`>>> [RETRY] Defer attempt ${attempt + 1} failed, retrying in ${backoffMs}ms...`);
+            await new Promise(r => setTimeout(r, backoffMs));
+        }
+    }
+    return false;
+}
+
+// Similar retry wrapper for fetch operations
+async function safeFetchWithRetry(url, options = {}, maxRetries = 3) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            return await safeFetch(url, options);
+        } catch (err) {
+            const isTransient = err.name === 'AbortError' || 
+                                err.code === 'UND_ERR_CONNECT_TIMEOUT' || 
+                                err.message?.includes('Connect Timeout') ||
+                                err.message?.includes('timeout');
+            
+            if (!isTransient || attempt === maxRetries - 1) {
+                throw err;
+            }
+            
+            const backoffMs = 1000 * Math.pow(2, attempt); // exponential: 1s, 2s, 4s
+            console.warn(`>>> [RETRY] Fetch attempt ${attempt + 1} failed for ${url}, retrying in ${backoffMs}ms...`);
+            await new Promise(r => setTimeout(r, backoffMs));
+        }
+    }
+}
+
 const safeInteractionReply = safeReply;
 const safeInteractionEditReply = safeEditReply;
 const safeInteractionDeferReply = safeDeferReply;
@@ -188,6 +238,7 @@ const safeInteractionFollowUp = safeFollowUp;
 module.exports = {
     safeFetch,
     safeFetchJson,
+    safeFetchWithRetry,
     createDiscordRestAdapter,
     safeReply,
     safeInteractionReply,
@@ -196,6 +247,7 @@ module.exports = {
     safeInteractionFollowUp,
     safeEditReply,
     safeDeferReply,
+    safeDeferWithRetry,
     safeFollowUp,
     safeMessageReply,
     safeChannelSend,

@@ -562,7 +562,14 @@ async function start() {
                         }
                     }
                 } catch (e) {
-                    console.error('>>> [LEADERBOARD] Error:', e.message);
+                    // Suppress non-fatal timeout errors from HF Spaces network
+                    if (e.message?.includes('Connect Timeout') || e.code === 'UND_ERR_CONNECT_TIMEOUT' || e.name === 'AbortError') {
+                        console.warn('>>> [LEADERBOARD] Skipped update (timeout — Discord unreachable, likely HF Spaces network restriction)');
+                    } else if (e.message?.includes('rate limit') || e.code === 429) {
+                        console.warn('>>> [LEADERBOARD] Skipped update (rate limited — will retry in 2 minutes)');
+                    } else {
+                        console.error('>>> [LEADERBOARD] Error:', e.message);
+                    }
                 } finally {
                     leaderboardUpdateRunning = false;
                 }
