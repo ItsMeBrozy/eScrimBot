@@ -1081,6 +1081,15 @@ async function sendMidMatchLeaveSubAlert(client, match, leaverId) {
 
 async function handleSubRequestInteraction(interaction, client) {
     try {
+        // Validate that safe functions are available
+        if (typeof safeInteractionReply !== 'function') {
+            console.error('>>> [SUB-INTERACTION-ERROR] safeInteractionReply not available as function:', typeof safeInteractionReply);
+            if (interaction.isRepliable()) {
+                await interaction.reply({ content: '❌ Internal error: sub system not ready.', ephemeral: true }).catch(() => {});
+            }
+            return true;
+        }
+
         const parts = interaction.customId.split('_');
         if (parts[0] !== 'sub' || parts[1] !== 'request') return false;
 
@@ -1238,6 +1247,19 @@ async function handleSubRequestInteraction(interaction, client) {
 
     } catch (err) {
         console.error('>>> [SUB-INTERACTION-ERROR] Failed to handle sub request:', err.message);
+        console.error('>>> [SUB-INTERACTION-ERROR] Stack:', err.stack?.split('\n').slice(0, 3).join('\n'));
+        // Attempt fallback response
+        if (interaction.isRepliable()) {
+            try {
+                if (interaction.deferred || interaction.replied) {
+                    await interaction.editReply({ content: '❌ Error processing substitution request.' }).catch(() => {});
+                } else {
+                    await interaction.reply({ content: '❌ Error processing substitution request.', ephemeral: true }).catch(() => {});
+                }
+            } catch (replyErr) {
+                console.error('>>> [SUB-INTERACTION-ERROR] Fallback response failed:', replyErr.message);
+            }
+        }
     }
     return false;
 }
